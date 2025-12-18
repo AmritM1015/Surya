@@ -3,6 +3,7 @@ import pandas as pd
 import xarray as xr
 import numpy as np
 import torch
+from downstream_examples.common.resize import resize_ts, resize_mask
 
 
 class EVEDSDataset(HelioNetCDFDataset):
@@ -194,6 +195,12 @@ class EVEDSDataset(HelioNetCDFDataset):
         # This lines assembles the dictionary that HelioFM's dataset returns (defined above)
         base_dictionary, metadata = super().__getitem__(idx=idx)
 
+        TARGET_SIZE = 256
+        base_dictionary["ts"] = resize_ts(
+            base_dictionary["ts"].float(),
+            TARGET_SIZE
+        )
+
         # We now add the eve intensity label
         base_dictionary["target"] = torch.tensor(
             self.df_valid_indices.iloc[idx]["normalized_spectrum"]
@@ -202,5 +209,9 @@ class EVEDSDataset(HelioNetCDFDataset):
             self.df_valid_indices.iloc[idx]["normalized_spectrum"]
         )
         # base_dictionary["ds_time"] = self.df_valid_indices.index[idx]
+
+        # TO BE REMOVED AFTER TESTING
+        assert base_dictionary["ts"].shape[-1] == 256
+        assert base_dictionary["target"].shape[0] == 1343
 
         return base_dictionary, metadata

@@ -1,6 +1,8 @@
 import pandas as pd
 
 from surya.datasets.helio import HelioNetCDFDataset
+from downstream_examples.common.resize import resize_ts
+
 
 
 class SolarFlareDataset(HelioNetCDFDataset):
@@ -72,7 +74,16 @@ class SolarFlareDataset(HelioNetCDFDataset):
     def _get_index_data(self, idx: int) -> tuple[dict, dict]:
         data, metadata = super()._get_index_data(idx)
 
+        TARGET_SIZE = 256
+        data["ts"] = resize_ts(
+            data["ts"].float(),
+            TARGET_SIZE
+        )
+
         reference_timestamp = self.valid_indices[idx]
         data["label"] = self.index.loc[reference_timestamp, "label_max"]
+
+        # TO BE REMOVED AFTER TESTING
+        assert data["ts"].shape[-1] == 256
 
         return data, metadata

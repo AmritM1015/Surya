@@ -6,9 +6,15 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from downstream_examples.common.resize import resize_ts, resize_mask
+
+
 
 # Append base path.  May need to be modified if the folder structure changes
 from surya.datasets.helio import HelioNetCDFDataset
+
+
 
 
 class ArDSDataset(HelioNetCDFDataset):
@@ -97,12 +103,21 @@ class ArDSDataset(HelioNetCDFDataset):
 
         # This lines assembles the dictionary that HelioFM's dataset returns (defined above)
         # base_dictionary, metadata = super().__getitem__(idx=idx)
+
+        TARGET_SIZE = 256
+        # Due to the computational cost of Surya’s native 4096×4096 resolution, 
+        # all SDO inputs and segmentation targets are spatially downsampled 
+        # to 256×256 at the dataset level prior to inference and fine-tuning.
+
+
         base_dictionary = {}
         timestep = self.valid_indices[idx]
         base_dictionary["ts"] = self.transform_data(
             self.load_nc_data(self.index.loc[timestep, "path"], timestep, self.channels)
         )
         base_dictionary["ts"] = np.stack([base_dictionary["ts"]], axis=1)
+        base_dictionary["ts"] = resize_ts(torch.from_numpy(base_dictionary["ts"]).float(), TARGET_SIZE)
+
         file_path = self.ar_valid_indices.iloc[idx]["file_path"]
 
         file_path = os.path.join("./assets/surya-bench-ar-segmentation", file_path)
@@ -115,7 +130,10 @@ class ArDSDataset(HelioNetCDFDataset):
             print(f"Error loading mask from {file_path}: {e}")
             raise e
 
+        mask = resize_mask(mask, TARGET_SIZE)
         base_dictionary["forecast"] = mask / 255.0
+
+        # base_dictionary["forecast"] = (mask.unsqueeze(0)/255.0)
         base_dictionary["time_delta_input"] = torch.tensor([0])
         # base_dictionary["forecast"] = mask["union_with_intersect"][:, :]
 
@@ -124,5 +142,9 @@ class ArDSDataset(HelioNetCDFDataset):
             "timestamps_input": timestep,
             "timestamps_targets": timestep,
         }
+        # TO BE REMOVED AFTER TESTING
+        assert isinstance(base_dictionary["ts"], torch.Tensor)
+        assert base_dictionary["ts"].shape[-1] == 256
+        assert base_dictionary["forecast"].shape[-1] == 256
 
         return base_dictionary, metadata

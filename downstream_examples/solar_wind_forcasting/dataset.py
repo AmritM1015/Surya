@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import torch
 from surya.utils.distributed import print0
+from downstream_examples.common.resize import resize_ts
+
 
 def logsign(x):
     return torch.sign(x) * torch.log10(torch.abs(x) + 1)
@@ -216,6 +218,12 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
         # This lines assembles the dictionary that HelioFM's dataset returns (defined above)
         base_dictionary, metadata = super().__getitem__(idx=idx)
 
+        TARGET_SIZE = 256
+        base_dictionary["ts"] = resize_ts(
+            base_dictionary["ts"].float(),
+            TARGET_SIZE
+        )
+
         # We now add the wind speed label
         target = torch.tensor(self.df_valid_indices.iloc[idx]["V"])
         # if self.ds_normalize and not unscale:
@@ -226,5 +234,7 @@ class WindSpeedDSDataset(HelioNetCDFDataset):
             ]
         )
         base_dictionary["ds_time"] = self.df_valid_indices.index[idx].timestamp()
+
+        assert base_dictionary["ts"].shape[-1] == 256
 
         return base_dictionary, metadata
