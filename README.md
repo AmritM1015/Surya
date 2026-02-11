@@ -66,25 +66,22 @@ uv sync
 source .venv/bin/activate
 ```
 
-### 🧑‍💻 Zero-Shot Inference
-
-This is the fastest path to run Surya foundation-model inference on a date range without any additional setup. Data is downloaded from the public S3 bucket `nasa-surya-bench`.
-
-After setting up the environment, you can run the following commands to run the zero-shot inference.
-
-1. **Run easy inference**
+4. **Zero-Shot Inference**
 ```bash
-source .venv/bin/activate
 EASY_CONFIG=easy_inference/config_easy.yaml bash easy_inference/run_easy_inference.sh
 ```
-This prompts for start/end UTC datetime, downloads needed `.nc` files, and writes:
+
+#### Note
+The above command is the fastest path to run Surya foundation-model inference on a date range without any additional setup. Data is downloaded from the public S3 bucket `nasa-surya-bench`. This prompts for start/end UTC datetime, downloads needed `.nc` files, and writes:
 - `easy_inference/outputs_.../prediction.nc`
 - `easy_inference/outputs_.../metrics/*`
 
-2. **Device selection behavior**
-- Please refer to the [config_easy.yaml](easy_inference/config_easy.yaml) file for the default device selection behavior.
+**Device selection behavior**
+- Please refer to the [config_easy.yaml](easy_inference/config_easy.yaml) file for the default inference configuration.
 - `advanced.device: auto` uses priority: `cuda -> mps -> cpu`
 - Works across CUDA GPUs, Apple Silicon/macOS MPS, and plain CPU systems
+
+---
 
 ### 🧪 Verify Installation
 
