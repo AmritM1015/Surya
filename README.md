@@ -68,7 +68,7 @@ source .venv/bin/activate
 
 4. **Zero-Shot Inference**
 ```bash
-EASY_CONFIG=easy_inference/config_easy.yaml bash easy_inference/run_easy_inference.sh
+python easy_inference/run_easy_inference.py --config-path easy_inference/config_easy.yaml
 ```
 
 #### Note
