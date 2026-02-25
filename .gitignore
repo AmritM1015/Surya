@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.pth
 *.pt
+*.nc
 # C extensions
 *.so
 *.DS_Store

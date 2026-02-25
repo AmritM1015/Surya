@@ -8,12 +8,12 @@ user:
   # Inclusive UTC end datetime for the download/inference window.
   # Format: YYYY-MM-DD HH:MM[:SS]
   end_datetime: "2014-10-23 17:00:00"
-  # If true, prompt in terminal to confirm/override start and end datetime.
+  # If true, prompt in terminal to confirm/override start/end datetime and rollout steps.
   prompt_for_dates: true
   # Directory where run artifacts are written (prediction.nc, metrics CSV/JSON).
-  output_dir: easy_inference/outputs_20141023_60min
-  # Max number of samples to process from the built dataset/index window.
-  samples: 1
+  output_dir: easy_inference/outputs_24h
+  # Number of autoregressive prediction steps to generate.
+  rollout_steps: 5
 
 # --------------------------------------------------------------------
 # Advanced section (optional). Leave as-is unless needed.
@@ -51,11 +51,6 @@ advanced:
   time_delta_input_minutes: [-60, 0]
   # Target offset (minutes) for the first prediction horizon.
   time_delta_target_minutes: 60
-  # Number of autoregressive prediction steps to generate.
-  rollout_steps: 2
-  # Number of target steps dataset returns for evaluation/loss.
-  # Keep aligned with rollout_steps unless intentionally testing mismatch behavior.
-  dataset_rollout_steps: 2
 
   # Download settings
   # Public S3 bucket containing benchmark .nc files.
@@ -76,14 +71,11 @@ advanced:
   device: auto
   # Compute dtype for inference. Values: auto | float32 | float16 | bfloat16
   dtype: auto
-  # Batch size for DataLoader/inference loop.
-  batch_size: 1
+  # Batch is fixed to 1 in easy mode (first valid sample only).
   # Number of DataLoader worker processes (0 = main process).
-  num_workers: 0
+  num_workers: 4
   # DataLoader prefetch batches per worker (used only when num_workers > 0).
   prefetch_factor: 2
-  # Number of initial batches excluded from timing metrics.
-  warmup: 0
   # If true, disable autocast mixed precision even when supported.
   disable_autocast: false
   # CPU thread count for torch. 0 leaves PyTorch default behavior.

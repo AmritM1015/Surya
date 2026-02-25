@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -20,13 +21,17 @@ from typing import Any
 import h5netcdf
 import numpy as np
 import pandas as pd
+import skimage.measure
 import torch
-import torch.nn.functional as F
+import xarray as xr
 import yaml
 from huggingface_hub import snapshot_download
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from surya.datasets.helio import HelioNetCDFDataset, inverse_transform_single_channel
+from surya.datasets.helio import (
+    inverse_transform_single_channel,
+    transform as helio_transform,
+)
 from surya.models.helio_spectformer import HelioSpectFormer
 from surya.utils.data import build_scalers, custom_collate_fn
 
@@ -38,7 +43,7 @@ DEFAULT_USER = {
     "end_datetime": "2014-10-23 17:00:00",
     "prompt_for_dates": True,
     "output_dir": "easy_inference/outputs_20141023_60min",
-    "samples": 1,
+    "rollout_steps": 2,
 }
 
 DEFAULT_ADVANCED = {
@@ -52,8 +57,6 @@ DEFAULT_ADVANCED = {
     "cadence_minutes": 60,
     "time_delta_input_minutes": [-60, 0],
     "time_delta_target_minutes": 60,
-    "rollout_steps": 2,
-    "dataset_rollout_steps": 2,
     "s3_bucket": "nasa-surya-bench",
     "download_skip_existing": True,
     "download_verify_size": False,
@@ -61,10 +64,8 @@ DEFAULT_ADVANCED = {
     "prune_validation_data_to_window": True,
     "device": "auto",
     "dtype": "auto",
-    "batch_size": 1,
     "num_workers": 0,
     "prefetch_factor": 2,
-    "warmup": 0,
     "disable_autocast": False,
     "cpu_threads": 0,
     "show_progress": True,
@@ -86,12 +87,22 @@ class DownloadSummary:
 
 @dataclass
 class InferenceSummary:
-    avg_loss: float
+    avg_loss: float | None
     timed_batches: int
     avg_data_seconds: float
     avg_infer_seconds: float
     prediction_nc_path: str
-    samples_written: int
+    mode: str
+
+
+@dataclass
+class CoverageSummary:
+    total_timestamps: int
+    present_timestamps: int
+    missing_timestamps: int
+    input_complete_references: int
+    full_target_references: int
+    missing_examples: list[str]
 
 
 class PredictionNetCDFWriter:
@@ -133,7 +144,10 @@ class PredictionNetCDFWriter:
         }
 
         self.file.attrs["title"] = "Surya predictions"
-        self.file.attrs["data_layout"] = "channel vars with dims (sample,prediction_time,y,x)"
+        self.file.attrs["data_layout"] = (
+            "prediction vars: <channel>, ground truth vars: gt_<channel>, "
+            "all dims=(sample,prediction_time,y,x)"
+        )
         self.file.attrs["inverse_transform"] = "signum-log inverse applied"
         self.file.attrs["spatial_shape"] = f"{self.height}x{self.width}"
         self.file.attrs["prediction_dtype"] = self.prediction_dtype.name
@@ -153,12 +167,24 @@ class PredictionNetCDFWriter:
         self.channel_names[...] = _encode_fixed_width(self.channels, self.channel_width)
 
         self.prediction_vars: dict[str, Any] = {}
+        self.ground_truth_vars: dict[str, Any] = {}
         for channel in self.channels:
             self.prediction_vars[channel] = self.file.create_variable(
                 channel,
                 ("sample", "prediction_time", "y", "x"),
                 dtype=self.prediction_dtype,
             )
+            gt_name = f"gt_{channel}"
+            self.ground_truth_vars[gt_name] = self.file.create_variable(
+                gt_name,
+                ("sample", "prediction_time", "y", "x"),
+                dtype=self.prediction_dtype,
+            )
+
+        self.file.attrs["prediction_variables"] = ",".join(self.channels)
+        self.file.attrs["ground_truth_variables"] = ",".join(
+            [f"gt_{channel}" for channel in self.channels]
+        )
 
     def write_sample_metadata(
         self,
@@ -186,10 +212,119 @@ class PredictionNetCDFWriter:
     ) -> None:
         self.prediction_vars[channel_name][sample_idx, prediction_step_idx, :, :] = frame_hw
 
+    def write_ground_truth_frame(
+        self,
+        sample_idx: int,
+        prediction_step_idx: int,
+        channel_name: str,
+        frame_hw: np.ndarray,
+    ) -> None:
+        gt_name = f"gt_{channel_name}"
+        self.ground_truth_vars[gt_name][sample_idx, prediction_step_idx, :, :] = frame_hw
+
     def finalize(self, samples_written: int) -> str:
         self.file.attrs["samples_written"] = int(samples_written)
         self.file.close()
         return self.output_path
+
+
+class InputOnlyRolloutDataset(Dataset):
+    """Input-complete dataset that tolerates missing targets by masking them."""
+
+    def __init__(
+        self,
+        present_index: pd.DataFrame,
+        reference_timestamps: list[pd.Timestamp],
+        channels: list[str],
+        time_delta_input_minutes: list[int],
+        time_delta_target_minutes: int,
+        prediction_steps: int,
+        scalers: dict[str, Any],
+        pooling: int,
+    ) -> None:
+        self.present_index = present_index.copy()
+        self.reference_timestamps = list(reference_timestamps)
+        self.channels = list(channels)
+        self.time_delta_input_minutes = sorted(int(v) for v in time_delta_input_minutes)
+        self.time_delta_target_minutes = int(time_delta_target_minutes)
+        self.prediction_steps = int(prediction_steps)
+        self.scalers = scalers
+        self.pooling = int(pooling) if pooling is not None else 1
+
+        if len(self.reference_timestamps) == 0:
+            raise ValueError("InputOnlyRolloutDataset requires at least one reference timestamp.")
+
+        self.present_index["path"] = self.present_index["path"].astype(str)
+        self.path_lookup = self.present_index["path"].to_dict()
+        self.latest_input_offset_minutes = self.time_delta_input_minutes[-1]
+
+    def __len__(self) -> int:
+        return len(self.reference_timestamps)
+
+    @cache
+    def transformation_inputs(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        means = np.array([self.scalers[ch].mean for ch in self.channels])
+        stds = np.array([self.scalers[ch].std for ch in self.channels])
+        epsilons = np.array([self.scalers[ch].epsilon for ch in self.channels])
+        sl_scale_factors = np.array([self.scalers[ch].sl_scale_factor for ch in self.channels])
+        return means, stds, epsilons, sl_scale_factors
+
+    def _load_transformed_frame(self, timestep: pd.Timestamp) -> np.ndarray:
+        if timestep not in self.path_lookup:
+            raise KeyError(f"Timestamp not present in index: {timestep}")
+        filepath = Path(self.path_lookup[timestep]).expanduser()
+        if not filepath.is_absolute():
+            filepath = (Path.cwd() / filepath).resolve()
+
+        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
+            data = ds[self.channels].to_array().load().to_numpy()
+
+        if self.pooling > 1:
+            data = skimage.measure.block_reduce(
+                data, block_size=(1, self.pooling, self.pooling), func=np.mean
+            )
+
+        means, stds, epsilons, sl_scale_factors = self.transformation_inputs()
+        transformed = helio_transform(data, means, stds, sl_scale_factors, epsilons)
+        return transformed.astype(np.float32, copy=False)
+
+    def __getitem__(self, idx: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        reference_timestep = self.reference_timestamps[idx]
+        input_timestamps = [
+            reference_timestep + timedelta(minutes=offset) for offset in self.time_delta_input_minutes
+        ]
+        input_frames = [self._load_transformed_frame(ts) for ts in input_timestamps]
+        stacked_inputs = np.stack(input_frames, axis=1).astype(np.float32, copy=False)
+
+        target_timestamps: list[np.datetime64] = []
+        for step in range(self.prediction_steps):
+            ts = reference_timestep + timedelta(
+                minutes=(step + 1) * self.time_delta_target_minutes
+            )
+            target_timestamps.append(np.datetime64(ts))
+
+        time_delta_input_float = (
+            self.latest_input_offset_minutes
+            - np.asarray(self.time_delta_input_minutes, dtype=np.float32)
+        ) / 60.0
+        lead_time_delta_float = (
+            self.latest_input_offset_minutes
+            - np.asarray(
+                [(step + 1) * self.time_delta_target_minutes for step in range(self.prediction_steps)],
+                dtype=np.float32,
+            )
+        ) / 60.0
+
+        batch_data = {
+            "ts": stacked_inputs,
+            "time_delta_input": time_delta_input_float.astype(np.float32, copy=False),
+            "lead_time_delta": lead_time_delta_float.astype(np.float32, copy=False),
+        }
+        metadata = {
+            "timestamps_input": np.asarray(input_timestamps, dtype="datetime64[ns]"),
+            "timestamps_targets": np.asarray(target_timestamps, dtype="datetime64[ns]"),
+        }
+        return batch_data, metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -210,9 +345,15 @@ def parse_args() -> argparse.Namespace:
         help="Override end datetime (UTC), format: YYYY-MM-DD HH:MM[:SS].",
     )
     parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=None,
+        help="Override user.rollout_steps.",
+    )
+    parser.add_argument(
         "--no-prompt",
         action="store_true",
-        help="Disable interactive date prompt.",
+        help="Disable interactive date/rollout prompt.",
     )
     parser.add_argument(
         "--skip-download",
@@ -260,13 +401,41 @@ def _prompt_datetime(label: str, default_value: datetime) -> datetime:
             print(f"Invalid datetime '{value}': {exc}")
 
 
+def _parse_rollout_steps(value: Any) -> int:
+    rollout_steps = int(value)
+    if rollout_steps < 0:
+        raise ValueError("rollout_steps must be >= 0.")
+    return rollout_steps
+
+
+def _prompt_rollout_steps(default_value: int) -> int:
+    default_text = str(int(default_value))
+    while True:
+        value = input(f"Rollout steps [{default_text}]: ").strip()
+        if value == "":
+            return int(default_value)
+        try:
+            return _parse_rollout_steps(value)
+        except (TypeError, ValueError) as exc:
+            print(f"Invalid rollout_steps '{value}': {exc}")
+
+
 def _load_easy_sections(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     with open(config_path, "r") as fp:
         raw = yaml.safe_load(fp) or {}
+    raw_user = raw.get("user", {}) or {}
+    raw_advanced = raw.get("advanced", {}) or {}
+
     user_cfg = deepcopy(DEFAULT_USER)
-    user_cfg.update(raw.get("user", {}))
+    user_cfg.update(raw_user)
+    # Backward-compatible fallback for older configs that still store rollout_steps in advanced.
+    if "rollout_steps" not in raw_user and "rollout_steps" in raw_advanced:
+        user_cfg["rollout_steps"] = raw_advanced["rollout_steps"]
+
     advanced_cfg = deepcopy(DEFAULT_ADVANCED)
-    advanced_cfg.update(raw.get("advanced", {}))
+    advanced_cfg.update(raw_advanced)
+    advanced_cfg.pop("rollout_steps", None)
+    advanced_cfg.pop("dataset_rollout_steps", None)
     return user_cfg, advanced_cfg
 
 
@@ -287,6 +456,20 @@ def _select_dates(
             f"End datetime must be >= start datetime. Got {_format_datetime(start_dt)} -> {_format_datetime(end_dt)}."
         )
     return start_dt, end_dt
+
+
+def _select_rollout_steps(
+    user_cfg: dict[str, Any],
+    cli_rollout_steps: int | None,
+    use_prompt: bool,
+) -> int:
+    if cli_rollout_steps is not None:
+        rollout_steps = _parse_rollout_steps(cli_rollout_steps)
+    else:
+        rollout_steps = _parse_rollout_steps(user_cfg["rollout_steps"])
+    if use_prompt:
+        rollout_steps = _prompt_rollout_steps(rollout_steps)
+    return rollout_steps
 
 
 def log_progress(enabled: bool, message: str) -> None:
@@ -440,6 +623,12 @@ def download_surya_bench_range(
             f"missing={len(missing_timestamps)} tolerance_min={tolerance_minutes}"
         ),
     )
+    if missing_timestamps:
+        log_progress(show_progress, "download status | [v]=available [x]=missing")
+        for ts in missing_timestamps:
+            log_progress(show_progress, f"download status | [x] {_format_datetime(ts)}")
+    else:
+        log_progress(show_progress, "download status | [v] all expected timestamps available")
 
     if not matched_files:
         raise RuntimeError("No matching files found for requested date range.")
@@ -636,8 +825,83 @@ def required_window_span_minutes(
     return int(max(required_offsets) - min(required_offsets))
 
 
+def _index_coverage_summary(
+    index_path: Path,
+    time_delta_input_minutes: list[int],
+    time_delta_target_minutes: int,
+    full_target_steps: int,
+) -> tuple[CoverageSummary, pd.DataFrame, list[pd.Timestamp], list[pd.Timestamp]]:
+    required_columns = {"path", "timestep", "present"}
+    index_df = pd.read_csv(index_path)
+    missing_columns = required_columns.difference(index_df.columns)
+    if missing_columns:
+        missing_list = ", ".join(sorted(missing_columns))
+        raise RuntimeError(f"Index CSV is missing required columns: {missing_list}")
+
+    index_df["timestep"] = pd.to_datetime(index_df["timestep"])
+    index_df.sort_values("timestep", inplace=True)
+    present_df = index_df[index_df["present"] == 1].copy()
+    present_df.set_index("timestep", inplace=True)
+    present_df.sort_index(inplace=True)
+    present_set = set(present_df.index)
+
+    input_offsets = [timedelta(minutes=int(v)) for v in sorted(time_delta_input_minutes)]
+    target_offsets = [
+        timedelta(minutes=(step + 1) * int(time_delta_target_minutes))
+        for step in range(int(full_target_steps))
+    ]
+
+    input_complete_refs: list[pd.Timestamp] = []
+    full_target_refs: list[pd.Timestamp] = []
+    for reference_timestep in sorted(present_set):
+        if all((reference_timestep + offset) in present_set for offset in input_offsets):
+            input_complete_refs.append(reference_timestep)
+            if all((reference_timestep + offset) in present_set for offset in target_offsets):
+                full_target_refs.append(reference_timestep)
+
+    missing_examples = (
+        index_df[index_df["present"] != 1]["timestep"]
+        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .head(8)
+        .tolist()
+    )
+    coverage = CoverageSummary(
+        total_timestamps=len(index_df),
+        present_timestamps=len(present_df),
+        missing_timestamps=int((index_df["present"] != 1).sum()),
+        input_complete_references=len(input_complete_refs),
+        full_target_references=len(full_target_refs),
+        missing_examples=missing_examples,
+    )
+    return coverage, present_df, input_complete_refs, full_target_refs
+
+
+def _synthesize_prediction_timestamps(
+    timestamps_input,
+    target_delta_minutes: int,
+    prediction_steps: int,
+) -> np.ndarray:
+    input_arr = np.asarray(timestamps_input).astype("datetime64[ns]")
+    if input_arr.size == 0:
+        raise ValueError("Cannot synthesize prediction timestamps without input timestamps.")
+    last_input = pd.Timestamp(input_arr[-1]).to_pydatetime()
+    synthesized = [
+        np.datetime64(last_input + timedelta(minutes=(step + 1) * int(target_delta_minutes)))
+        for step in range(int(prediction_steps))
+    ]
+    return np.asarray(synthesized, dtype="datetime64[ns]")
+
+
 def _datetime_strings(values) -> list[str]:
     return np.asarray(values).astype("datetime64[s]").astype(str).tolist()
+
+
+def _format_items_for_log(values: list[str], max_items: int | None = None) -> str:
+    if max_items is not None and len(values) > max_items:
+        head = values[:max_items]
+        remaining = len(values) - max_items
+        return "[" + ", ".join(head) + f", ... (+{remaining} more)]"
+    return "[" + ", ".join(values) + "]"
 
 
 def _encode_fixed_width(strings: list[str], width: int) -> np.ndarray:
@@ -645,11 +909,45 @@ def _encode_fixed_width(strings: list[str], width: int) -> np.ndarray:
     return arr.view("S1").reshape(len(strings), width)
 
 
+def _validate_rollout_against_window(
+    start_dt: datetime,
+    end_dt: datetime,
+    time_delta_input_minutes: list[int],
+    time_delta_target_minutes: int,
+    rollout_steps: int,
+) -> None:
+    input_offsets = [int(v) for v in time_delta_input_minutes]
+    earliest_reference = pd.Timestamp(start_dt) - pd.Timedelta(minutes=min(input_offsets))
+    target_delta_minutes = int(time_delta_target_minutes)
+    max_steps_fit = int(
+        (pd.Timestamp(end_dt) - earliest_reference).total_seconds() // (target_delta_minutes * 60)
+    )
+    max_rollout = max_steps_fit - 1
+    if rollout_steps <= max_rollout:
+        return
+
+    required_end = earliest_reference.to_pydatetime() + timedelta(
+        minutes=(int(rollout_steps) + 1) * target_delta_minutes
+    )
+    suggested_rollout = max(0, max_rollout)
+    raise ValueError(
+        "Requested rollout_steps does not fit inside the selected window.\n"
+        f"  start_datetime: {_format_datetime(start_dt)} UTC\n"
+        f"  end_datetime  : {_format_datetime(end_dt)} UTC\n"
+        f"  first reference timestep: {_format_datetime(earliest_reference.to_pydatetime())} UTC\n"
+        f"  requested rollout_steps : {int(rollout_steps)}\n"
+        f"  max rollout_steps allowed for this window: {suggested_rollout}\n"
+        f"Suggestion:\n"
+        f"  1) Set user.rollout_steps to <= {suggested_rollout}\n"
+        f"  2) Or extend user.end_datetime to >= {_format_datetime(required_end)} UTC"
+    )
+
+
 def run_inference_pipeline(
     advanced_cfg: dict[str, Any],
     config_dir: Path,
     prediction_nc_path: Path,
-    samples: int,
+    rollout_steps: int,
     show_progress: bool,
 ) -> InferenceSummary:
     foundation_config_path = _resolve_path(str(advanced_cfg["foundation_config_path"]), config_dir)
@@ -680,39 +978,58 @@ def run_inference_pipeline(
     model.to(device)
     model.eval()
 
-    rollout_steps = int(advanced_cfg["rollout_steps"])
-    dataset_rollout_steps = int(advanced_cfg["dataset_rollout_steps"])
-    dataset = HelioNetCDFDataset(
-        index_path=str(index_path),
-        time_delta_input_minutes=base_config["data"]["time_delta_input_minutes"],
-        time_delta_target_minutes=base_config["data"]["time_delta_target_minutes"],
-        n_input_timestamps=len(base_config["data"]["time_delta_input_minutes"]),
-        rollout_steps=dataset_rollout_steps,
-        channels=base_config["data"]["sdo_channels"],
-        drop_hmi_probability=base_config["data"]["drop_hmi_probability"],
-        num_mask_aia_channels=base_config["data"]["num_mask_aia_channels"],
-        use_latitude_in_learned_flow=base_config["data"]["use_latitude_in_learned_flow"],
-        scalers=scalers,
-        phase="valid",
-        pooling=base_config["data"]["pooling"],
-        random_vert_flip=base_config["data"]["random_vert_flip"],
+    rollout_steps = int(rollout_steps)
+    prediction_steps = rollout_steps + 1
+    coverage, present_index, input_complete_refs, _ = _index_coverage_summary(
+        index_path=index_path,
+        time_delta_input_minutes=[int(v) for v in base_config["data"]["time_delta_input_minutes"]],
+        time_delta_target_minutes=int(base_config["data"]["time_delta_target_minutes"]),
+        full_target_steps=prediction_steps,
+    )
+    input_offsets_minutes = sorted(int(v) for v in base_config["data"]["time_delta_input_minutes"])
+    log_progress(
+        show_progress,
+        (
+            "rollout plan | "
+            f"input_offsets_min={input_offsets_minutes} "
+            f"target_delta_min={int(base_config['data']['time_delta_target_minutes'])} "
+            f"prediction_steps={prediction_steps}"
+        ),
     )
 
-    if len(dataset) == 0:
-        min_span = required_window_span_minutes(
-            time_delta_input_minutes=[int(v) for v in base_config["data"]["time_delta_input_minutes"]],
-            time_delta_target_minutes=int(base_config["data"]["time_delta_target_minutes"]),
-            rollout_steps=dataset_rollout_steps,
-        )
+    if coverage.input_complete_references == 0:
+        input_deltas = [int(v) for v in base_config["data"]["time_delta_input_minutes"]]
+        input_span_minutes = int(max(input_deltas) - min(input_deltas))
+        missing_preview = ", ".join(coverage.missing_examples) if coverage.missing_examples else "none"
         raise RuntimeError(
-            "No valid samples in dataset. Increase date range. "
-            f"Required coverage is at least {min_span} minutes for rollout={dataset_rollout_steps}."
+            "Input data is missing for required input offsets. "
+            f"Required input offsets={input_deltas} (span={input_span_minutes} minutes). "
+            f"Index present={coverage.present_timestamps}, missing={coverage.missing_timestamps}. "
+            f"Missing timestamp sample: {missing_preview}."
         )
+
+    if coverage.full_target_references == 0:
+        print(
+            "[warning] Missing target coverage detected. "
+            "Inference will continue with available GT only.",
+            flush=True,
+        )
+
+    dataset: Any = InputOnlyRolloutDataset(
+        present_index=present_index,
+        reference_timestamps=input_complete_refs,
+        channels=list(base_config["data"]["sdo_channels"]),
+        time_delta_input_minutes=base_config["data"]["time_delta_input_minutes"],
+        time_delta_target_minutes=int(base_config["data"]["time_delta_target_minutes"]),
+        prediction_steps=prediction_steps,
+        scalers=scalers,
+        pooling=int(base_config["data"]["pooling"]),
+    )
 
     dataloader_kwargs = {
         "dataset": dataset,
         "shuffle": False,
-        "batch_size": int(advanced_cfg["batch_size"]),
+        "batch_size": 1,
         "num_workers": int(advanced_cfg["num_workers"]),
         "pin_memory": device_type == "cuda",
         "drop_last": False,
@@ -723,11 +1040,12 @@ def run_inference_pipeline(
         dataloader_kwargs["persistent_workers"] = True
     dataloader = DataLoader(**dataloader_kwargs)
 
-    max_batches = min(int(samples), len(dataloader))
-    if max_batches <= 0:
-        raise RuntimeError("No batches available.")
+    if len(dataloader) <= 0:
+        raise RuntimeError("No batches available after filtering for required input data.")
 
     channels = list(base_config["data"]["sdo_channels"])
+    present_path_lookup = present_index["path"].to_dict()
+    pooling = int(base_config["data"]["pooling"])
     np_dtype = resolve_numpy_dtype(str(advanced_cfg["prediction_dtype"]))
     means, stds, epsilons, sl_scale_factors = dataset.transformation_inputs()
     img_size = int(base_config["model"]["img_size"])
@@ -743,122 +1061,214 @@ def run_inference_pipeline(
             sl_scale_factor=sl_scale_factors[channel_idx],
         )
 
+    def load_gt_frame_for_prediction_timestamp(ts_value) -> np.ndarray | None:
+        ts = pd.Timestamp(np.asarray(ts_value).astype("datetime64[ns]").item())
+        path_string = present_path_lookup.get(ts)
+        if path_string is None:
+            return None
+
+        filepath = Path(path_string).expanduser()
+        if not filepath.is_absolute():
+            filepath = (Path.cwd() / filepath).resolve()
+        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
+            frame = ds[channels].to_array().load().to_numpy()
+        if pooling > 1:
+            frame = skimage.measure.block_reduce(
+                frame, block_size=(1, pooling, pooling), func=np.mean
+            )
+        return frame.astype(np_dtype, copy=False)
+
     autocast_enabled = (not bool(advanced_cfg["disable_autocast"])) and supports_autocast(
         device_type=device_type, dtype=amp_dtype
     )
-    prediction_steps = rollout_steps + 1
-    sample_capacity = max_batches * int(advanced_cfg["batch_size"])
-    writer: PredictionNetCDFWriter | None = None
+    sample_capacity = 1
 
-    losses: list[float] = []
-    data_times: list[float] = []
-    infer_times: list[float] = []
-    global_sample_idx = 0
+    gt_pairs_used = 0
+    gt_pairs_expected = 0
 
     iterator = iter(dataloader)
-    for batch_idx in range(max_batches):
-        log_progress(show_progress, f"batch {batch_idx + 1}/{max_batches} | loading data")
-        t_data = perf_counter()
-        batch_data, batch_metadata = next(iterator)
-        data_elapsed = perf_counter() - t_data
+    log_progress(show_progress, "batch 1/1 | loading data")
+    t_data = perf_counter()
+    batch_data, batch_metadata = next(iterator)
+    data_elapsed = perf_counter() - t_data
 
-        ts = batch_data["ts"].to(device, non_blocking=True)
-        time_delta_input = batch_data["time_delta_input"].to(device, non_blocking=True)
-        full_h = int(batch_data["ts"].shape[-2])
-        full_w = int(batch_data["ts"].shape[-1])
-        if full_h != 4096 or full_w != 4096:
-            raise RuntimeError(f"Expected input shape 4096x4096, got {full_h}x{full_w}.")
+    ts = batch_data["ts"].to(device, non_blocking=True)
+    time_delta_input = batch_data["time_delta_input"].to(device, non_blocking=True)
+    full_h = int(batch_data["ts"].shape[-2])
+    full_w = int(batch_data["ts"].shape[-1])
+    if full_h != 4096 or full_w != 4096:
+        raise RuntimeError(f"Expected input shape 4096x4096, got {full_h}x{full_w}.")
 
-        batch_size = int(batch_data["ts"].shape[0])
-        input_steps = int(batch_data["ts"].shape[2])
-        gt_steps = int(batch_data["forecast"].shape[2])
-        if gt_steps < prediction_steps:
-            raise RuntimeError(f"GT steps ({gt_steps}) < prediction steps ({prediction_steps}).")
+    batch_size = int(batch_data["ts"].shape[0])
+    if batch_size != 1:
+        raise RuntimeError(f"Easy inference expects batch size 1, got {batch_size}.")
+    input_steps = int(batch_data["ts"].shape[2])
+    log_progress(
+        show_progress,
+        (
+            "batch 1/1 | tensors "
+            f"input_ts={tuple(ts.shape)} time_delta_input={tuple(time_delta_input.shape)}"
+        ),
+    )
 
-        if writer is None:
-            writer = PredictionNetCDFWriter(
-                output_path=str(prediction_nc_path),
-                channels=channels,
-                prediction_dtype=np_dtype,
-                input_steps=input_steps,
-                prediction_steps=prediction_steps,
-                shape_hw=(full_h, full_w),
-                sample_capacity=sample_capacity,
-            )
-            log_progress(
-                show_progress,
-                f"initialized prediction.nc writer | shape={sample_capacity}x{prediction_steps}x{full_h}x{full_w}",
-            )
+    writer = PredictionNetCDFWriter(
+        output_path=str(prediction_nc_path),
+        channels=channels,
+        prediction_dtype=np_dtype,
+        input_steps=input_steps,
+        prediction_steps=prediction_steps,
+        shape_hw=(full_h, full_w),
+        sample_capacity=sample_capacity,
+    )
+    log_progress(
+        show_progress,
+        f"initialized prediction.nc writer | shape={sample_capacity}x{prediction_steps}x{full_h}x{full_w}",
+    )
+    nan_frame_hw = np.full((full_h, full_w), np.nan, dtype=np_dtype)
 
-        sample_states: list[dict[str, Any]] = []
-        for sample_idx_in_batch in range(batch_size):
-            sample_global_id = global_sample_idx + sample_idx_in_batch
-            timestamps_input = batch_metadata["timestamps_input"][sample_idx_in_batch]
-            timestamps_targets = batch_metadata["timestamps_targets"][sample_idx_in_batch]
-            writer.write_sample_metadata(
-                sample_idx=sample_global_id,
-                sample_id=sample_global_id,
-                timestamps_input=timestamps_input,
-                timestamps_prediction=timestamps_targets[:prediction_steps],
-            )
-            sample_states.append({"sample_id": sample_global_id})
+    sample_id = 0
+    input_timestamps = np.asarray(batch_metadata["timestamps_input"][0]).astype("datetime64[ns]")
+    prediction_timestamps = _synthesize_prediction_timestamps(
+        timestamps_input=input_timestamps,
+        target_delta_minutes=int(base_config["data"]["time_delta_target_minutes"]),
+        prediction_steps=prediction_steps,
+    )
+    writer.write_sample_metadata(
+        sample_idx=sample_id,
+        sample_id=sample_id,
+        timestamps_input=input_timestamps,
+        timestamps_prediction=prediction_timestamps,
+    )
 
-        t_infer = perf_counter()
-        autocast_ctx = torch.autocast(device_type=device_type, dtype=amp_dtype) if autocast_enabled else nullcontext()
-        step_losses: list[float] = []
-        curr_ts = ts
-        with torch.no_grad():
-            with autocast_ctx:
-                for step in range(prediction_steps):
-                    pred = model({"ts": curr_ts, "time_delta_input": time_delta_input})
-                    target = batch_data["forecast"][:, :, step, ...].to(device, non_blocking=True)
-                    step_losses.append(float(F.mse_loss(pred.float(), target.float()).item()))
+    t_infer = perf_counter()
+    autocast_ctx = torch.autocast(device_type=device_type, dtype=amp_dtype) if autocast_enabled else nullcontext()
+    step_losses: list[float] = []
+    curr_ts = ts
+    example_input_window = list(input_timestamps)
+    example_output_timestamps = prediction_timestamps
+    example_input_labels = [f"GT_{ts}" for ts in _datetime_strings(example_input_window)]
+    example_output_labels = [
+        f"PR_{step_idx + 1}_{ts}"
+        for step_idx, ts in enumerate(_datetime_strings(example_output_timestamps))
+    ]
+    log_progress(
+        show_progress,
+        (
+            "label legend | "
+            "GT_<date>=ground-truth input timestamp, "
+            "PR_<step>_<date>=autoregressive prediction timestamp"
+        ),
+    )
+    log_progress(
+        show_progress,
+        f"batch 1/1 | example_input_window_labels={_format_items_for_log(example_input_labels)}",
+    )
+    log_progress(
+        show_progress,
+        (
+            "batch 1/1 | example_output_labels="
+            f"{_format_items_for_log(example_output_labels, max_items=32)}"
+        ),
+    )
 
-                    pred_cpu = pred.detach().cpu().float().numpy()
-                    for sample_idx_in_batch, state in enumerate(sample_states):
-                        for channel_idx, channel_name in enumerate(channels):
-                            pred_frame = pred_cpu[sample_idx_in_batch, channel_idx]
-                            pred_inv = inverse_channel_fn(channel_idx, pred_frame.astype(np.float32, copy=False))
-                            writer.write_prediction_frame(
-                                sample_idx=state["sample_id"],
-                                prediction_step_idx=step,
-                                channel_name=channel_name,
-                                frame_hw=pred_inv.astype(np_dtype, copy=False),
-                            )
-                    curr_ts = torch.cat((curr_ts[:, :, 1:, ...], pred[:, :, None, ...]), dim=2)
+    with torch.no_grad():
+        with autocast_ctx:
+            for step in range(prediction_steps):
+                pred = model({"ts": curr_ts, "time_delta_input": time_delta_input})
+                gt_pairs_expected += 1
 
-        sync_device(device_type)
-        infer_elapsed = perf_counter() - t_infer
-        batch_loss = float(np.mean(step_losses))
-        log_progress(
-            show_progress,
-            (
-                f"batch {batch_idx + 1}/{max_batches} | done forward | "
-                f"loss={batch_loss:.6f} | infer_s={infer_elapsed:.3f}"
-            ),
-        )
+                if step == 0:
+                    log_progress(
+                        show_progress,
+                        f"batch 1/1 | model_shapes in={tuple(curr_ts.shape)} out={tuple(pred.shape)}",
+                    )
 
-        if batch_idx >= int(advanced_cfg["warmup"]):
-            losses.append(batch_loss)
-            data_times.append(data_elapsed)
-            infer_times.append(infer_elapsed)
+                pred_cpu = pred.detach().cpu().float().numpy()
+                gt_frame_sample = load_gt_frame_for_prediction_timestamp(example_output_timestamps[step])
+                index_gt_pairs = 1 if gt_frame_sample is not None else 0
+                if index_gt_pairs > 0:
+                    gt_pairs_used += index_gt_pairs
 
-        global_sample_idx += batch_size
+                gt_channel_losses: list[float] = []
+                for channel_idx, channel_name in enumerate(channels):
+                    pred_frame = pred_cpu[0, channel_idx]
+                    pred_inv = inverse_channel_fn(channel_idx, pred_frame.astype(np.float32, copy=False))
+                    pred_hw = pred_inv.astype(np_dtype, copy=False)
+                    writer.write_prediction_frame(
+                        sample_idx=sample_id,
+                        prediction_step_idx=step,
+                        channel_name=channel_name,
+                        frame_hw=pred_hw,
+                    )
+                    if gt_frame_sample is None:
+                        gt_hw = nan_frame_hw
+                    else:
+                        gt_hw = gt_frame_sample[channel_idx]
+                        diff_hw = pred_inv.astype(np.float32, copy=False) - gt_hw.astype(np.float32, copy=False)
+                        gt_channel_losses.append(float(np.mean(diff_hw * diff_hw)))
+                    writer.write_ground_truth_frame(
+                        sample_idx=sample_id,
+                        prediction_step_idx=step,
+                        channel_name=channel_name,
+                        frame_hw=gt_hw,
+                    )
 
-    if writer is None:
-        raise RuntimeError("Prediction writer was not initialized.")
-    output_path = writer.finalize(samples_written=global_sample_idx)
+                index_step_loss = float(np.mean(gt_channel_losses)) if gt_channel_losses else None
+                if index_step_loss is not None:
+                    step_losses.append(index_step_loss)
+
+                output_ts = example_output_timestamps[step]
+                output_label = example_output_labels[step]
+                step_loss_text = (
+                    f"loss={index_step_loss:.6f}" if index_step_loss is not None else "GT missing"
+                )
+                log_progress(
+                    show_progress,
+                    (
+                        f"infer step {step + 1}/{prediction_steps} "
+                        f"| in={_format_items_for_log(example_input_labels, max_items=32)} "
+                        f"-> out={output_label} | {step_loss_text}"
+                    ),
+                )
+                example_input_window = example_input_window[1:] + [output_ts]
+                example_input_labels = example_input_labels[1:] + [output_label]
+                curr_ts = torch.cat((curr_ts[:, :, 1:, ...], pred[:, :, None, ...]), dim=2)
+
+    sync_device(device_type)
+    infer_elapsed = perf_counter() - t_infer
+    batch_loss = float(np.mean(step_losses)) if step_losses else float("nan")
+    batch_loss_text = f"loss={batch_loss:.6f}" if np.isfinite(batch_loss) else "GT missing"
+    log_progress(
+        show_progress,
+        (
+            "batch 1/1 | done forward | "
+            f"{batch_loss_text} | gt_steps_used={len(step_losses)}/{prediction_steps} "
+            f"| infer_s={infer_elapsed:.3f}"
+        ),
+    )
+
+    output_path = writer.finalize(samples_written=1)
     log_progress(show_progress, f"saved prediction.nc | path={output_path}")
 
-    if not infer_times:
-        raise RuntimeError("No timed batches after warmup; reduce warmup or increase samples.")
+    if not np.isfinite(batch_loss):
+        log_progress(
+            show_progress,
+            "No valid ground-truth targets available for requested rollout. GT missing; saving predictions without MSE.",
+        )
+    if gt_pairs_used == 0:
+        mode = "input_only"
+    elif gt_pairs_used < gt_pairs_expected:
+        mode = "partial_gt"
+    else:
+        mode = "full_gt"
+
     return InferenceSummary(
-        avg_loss=float(np.mean(losses)),
-        timed_batches=len(infer_times),
-        avg_data_seconds=float(np.mean(data_times)),
-        avg_infer_seconds=float(np.mean(infer_times)),
+        avg_loss=batch_loss if np.isfinite(batch_loss) else None,
+        timed_batches=1,
+        avg_data_seconds=data_elapsed,
+        avg_infer_seconds=infer_elapsed,
         prediction_nc_path=output_path,
-        samples_written=global_sample_idx,
+        mode=mode,
     )
 
 
@@ -886,11 +1296,16 @@ def print_report(
         )
         print(f"Download output dir  : {download_summary.output_dir}")
     if inference_summary is not None:
-        print(f"Samples written      : {inference_summary.samples_written}")
-        print(f"Avg rollout MSE      : {inference_summary.avg_loss:.6f}")
+        print(f"Inference mode       : {inference_summary.mode}")
+        print("Sample selection     : first valid sample only (batch=1)")
+        if inference_summary.avg_loss is None or not np.isfinite(float(inference_summary.avg_loss)):
+            print("Avg rollout MSE      : GT missing")
+        else:
+            print(f"Avg rollout MSE      : {float(inference_summary.avg_loss):.6f}")
         print(f"Avg data sec         : {inference_summary.avg_data_seconds:.3f}")
         print(f"Avg infer sec        : {inference_summary.avg_infer_seconds:.3f}")
         print(f"Prediction file      : {inference_summary.prediction_nc_path}")
+        print("GT variables         : gt_<channel> (NaN where GT is unavailable)")
     print("=" * 72)
 
 
@@ -905,6 +1320,11 @@ def main() -> int:
         user_cfg=user_cfg,
         cli_start=args.start_datetime,
         cli_end=args.end_datetime,
+        use_prompt=prompt_for_dates,
+    )
+    rollout_steps = _select_rollout_steps(
+        user_cfg=user_cfg,
+        cli_rollout_steps=args.rollout_steps,
         use_prompt=prompt_for_dates,
     )
 
@@ -924,11 +1344,29 @@ def main() -> int:
     print(f"Validation data dir  : {validation_data_dir}")
     print(f"Index CSV            : {index_path}")
     print(f"Prediction output    : {prediction_nc_path}")
-    print(f"Rollout steps        : {int(advanced_cfg['rollout_steps'])}")
+    print(f"Rollout steps        : {int(rollout_steps)}")
+    print(f"Prediction steps     : {int(rollout_steps) + 1}")
+    print(
+        f"Input offsets (min)  : {[int(v) for v in advanced_cfg['time_delta_input_minutes']]}"
+    )
+    print(f"Target delta (min)   : {int(advanced_cfg['time_delta_target_minutes'])}")
+    print("Sample mode          : first valid sample only (batch=1)")
 
     if args.dry_run:
         print("Dry run enabled. No download or inference executed.")
         return 0
+
+    try:
+        _validate_rollout_against_window(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            time_delta_input_minutes=[int(v) for v in advanced_cfg["time_delta_input_minutes"]],
+            time_delta_target_minutes=int(advanced_cfg["time_delta_target_minutes"]),
+            rollout_steps=int(rollout_steps),
+        )
+    except Exception as exc:
+        print(f"ERROR rollout validation: {exc}", file=sys.stderr)
+        return 1
 
     try:
         ensure_model_assets(advanced_cfg=advanced_cfg, config_dir=config_dir)
@@ -964,13 +1402,12 @@ def main() -> int:
         end_datetime=end_dt,
         cadence_minutes=int(advanced_cfg["cadence_minutes"]),
     )
-
     try:
         inference_summary = run_inference_pipeline(
             advanced_cfg=advanced_cfg,
             config_dir=config_dir,
             prediction_nc_path=prediction_nc_path,
-            samples=int(user_cfg["samples"]),
+            rollout_steps=int(rollout_steps),
             show_progress=show_progress,
         )
     except Exception as exc:
