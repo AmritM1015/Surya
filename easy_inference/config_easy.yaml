@@ -63,7 +63,7 @@ advanced:
   # 0 means exact timestamp match only.
   download_match_tolerance_minutes: 0
   # If true, remove local validation files outside the requested window before download.
-  prune_validation_data_to_window: true
+  prune_validation_data_to_window: false
 
   # Runtime
   # Device selection. Values: auto | cuda | mps | cpu
@@ -73,15 +73,25 @@ advanced:
   dtype: auto
   # Batch is fixed to 1 in easy mode (first valid sample only).
   # Number of DataLoader worker processes (0 = main process).
-  num_workers: 4
+  num_workers: 0
   # DataLoader prefetch batches per worker (used only when num_workers > 0).
   prefetch_factor: 2
+  # Number of background workers for GT timestep prefetch during rollout (>=1).
+  gt_prefetch_workers: 1
   # If true, disable autocast mixed precision even when supported.
   disable_autocast: false
+  # If true, allow TF32 fast matmul/cudnn paths on CUDA.
+  enable_tf32: true
+  # If true, enable cuDNN benchmark autotuning (CUDA only).
+  enable_cudnn_benchmark: true
   # CPU thread count for torch. 0 leaves PyTorch default behavior.
   cpu_threads: 0
   # If true, print progress logs for download and inference stages.
   show_progress: true
+  # If true, write detailed debug profiling logs (plain text).
+  debug_mode: false
+  # Optional path for debug log file. Empty -> <user.output_dir>/inference_debug.txt
+  debug_log_path: ""
 
   # Output dtype for saved prediction.nc values. Values: float16 | float32
   prediction_dtype: float32

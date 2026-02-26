@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
 from time import perf_counter
@@ -23,13 +24,11 @@ import numpy as np
 import pandas as pd
 import skimage.measure
 import torch
-import xarray as xr
 import yaml
 from huggingface_hub import snapshot_download
 from torch.utils.data import DataLoader, Dataset
 
 from surya.datasets.helio import (
-    inverse_transform_single_channel,
     transform as helio_transform,
 )
 from surya.models.helio_spectformer import HelioSpectFormer
@@ -37,40 +36,6 @@ from surya.utils.data import build_scalers, custom_collate_fn
 
 S3_FILE_PATTERN = re.compile(r"(\d{8})_(\d{4})\.nc$")
 DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
-
-DEFAULT_USER = {
-    "start_datetime": "2014-10-23 10:00:00",
-    "end_datetime": "2014-10-23 17:00:00",
-    "prompt_for_dates": True,
-    "output_dir": "easy_inference/outputs_20141023_60min",
-    "rollout_steps": 2,
-}
-
-DEFAULT_ADVANCED = {
-    "foundation_config_path": "data/Surya-1.0/config.yaml",
-    "scalers_path": "data/Surya-1.0/scalers.yaml",
-    "weights_path": "data/Surya-1.0/surya.366m.v1.pt",
-    "model_repo_id": "nasa-ibm-ai4science/Surya-1.0",
-    "model_allow_patterns": ["config.yaml", "scalers.yaml", "surya.366m.v1.pt"],
-    "validation_data_dir": "data/Surya-1.0_validation_data_20141023_60min",
-    "index_path": "easy_inference/index_20141023_60min.csv",
-    "cadence_minutes": 60,
-    "time_delta_input_minutes": [-60, 0],
-    "time_delta_target_minutes": 60,
-    "s3_bucket": "nasa-surya-bench",
-    "download_skip_existing": True,
-    "download_verify_size": False,
-    "download_match_tolerance_minutes": 0,
-    "prune_validation_data_to_window": True,
-    "device": "auto",
-    "dtype": "auto",
-    "num_workers": 0,
-    "prefetch_factor": 2,
-    "disable_autocast": False,
-    "cpu_threads": 0,
-    "show_progress": True,
-    "prediction_dtype": "float32",
-}
 
 
 @dataclass
@@ -103,6 +68,70 @@ class CoverageSummary:
     input_complete_references: int
     full_target_references: int
     missing_examples: list[str]
+
+
+class DebugLogger:
+    def __init__(self, enabled: bool, log_path: Path | None) -> None:
+        self.enabled = bool(enabled)
+        self.log_path = str(log_path.resolve()) if (self.enabled and log_path is not None) else ""
+        self._fp = None
+        self._line_number = 0
+        if self.enabled:
+            if log_path is None:
+                raise ValueError("debug_mode is enabled but debug_log_path is not set.")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._fp = open(log_path, "w", encoding="utf-8", buffering=1)
+            self.log("debug_started", log_path=self.log_path)
+
+    @staticmethod
+    def _format_value(value: Any) -> str:
+        if isinstance(value, (float, np.floating)):
+            value_float = float(value)
+            if np.isfinite(value_float):
+                return f"{value_float:.6f}"
+            return str(value_float)
+        if isinstance(value, (list, tuple)):
+            return "[" + ", ".join(str(item) for item in value) + "]"
+        if isinstance(value, dict):
+            entries = ", ".join(f"{key}={value[key]}" for key in sorted(value))
+            return "{" + entries + "}"
+        return str(value)
+
+    @staticmethod
+    def _caller_location() -> str:
+        frame = inspect.currentframe()
+        try:
+            if frame is None:
+                return "unknown:0"
+            log_frame = frame.f_back
+            if log_frame is None:
+                return "unknown:0"
+            caller_frame = log_frame.f_back
+            if caller_frame is None:
+                return "unknown:0"
+            caller_file = Path(caller_frame.f_code.co_filename).name
+            return f"{caller_file}:{caller_frame.f_lineno}"
+        finally:
+            del frame
+
+    def log(self, event: str, **payload: Any) -> None:
+        if not self.enabled or self._fp is None:
+            return
+        self._line_number += 1
+        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        location = self._caller_location()
+        payload_items = [f"{key}={self._format_value(value)}" for key, value in sorted(payload.items())]
+        payload_text = " | ".join(payload_items)
+        line = f"{self._line_number:06d} | {ts_utc} | {location} | {event}"
+        if payload_text:
+            line = f"{line} | {payload_text}"
+        self._fp.write(line + "\n")
+
+    def close(self) -> None:
+        if self._fp is not None:
+            self.log("debug_finished")
+            self._fp.close()
+            self._fp = None
 
 
 class PredictionNetCDFWriter:
@@ -241,6 +270,7 @@ class InputOnlyRolloutDataset(Dataset):
         prediction_steps: int,
         scalers: dict[str, Any],
         pooling: int,
+        debug_logger: DebugLogger | None = None,
     ) -> None:
         self.present_index = present_index.copy()
         self.reference_timestamps = list(reference_timestamps)
@@ -250,6 +280,7 @@ class InputOnlyRolloutDataset(Dataset):
         self.prediction_steps = int(prediction_steps)
         self.scalers = scalers
         self.pooling = int(pooling) if pooling is not None else 1
+        self.debug_logger = debug_logger
 
         if len(self.reference_timestamps) == 0:
             raise ValueError("InputOnlyRolloutDataset requires at least one reference timestamp.")
@@ -275,18 +306,33 @@ class InputOnlyRolloutDataset(Dataset):
         filepath = Path(self.path_lookup[timestep]).expanduser()
         if not filepath.is_absolute():
             filepath = (Path.cwd() / filepath).resolve()
+        t_read = perf_counter()
+        data = _read_channels_frame(filepath=filepath, channels=self.channels)
+        read_s = perf_counter() - t_read
 
-        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
-            data = ds[self.channels].to_array().load().to_numpy()
-
+        t_pool = perf_counter()
         if self.pooling > 1:
             data = skimage.measure.block_reduce(
                 data, block_size=(1, self.pooling, self.pooling), func=np.mean
             )
+        pool_s = perf_counter() - t_pool
 
+        t_transform = perf_counter()
         means, stds, epsilons, sl_scale_factors = self.transformation_inputs()
         transformed = helio_transform(data, means, stds, sl_scale_factors, epsilons)
-        return transformed.astype(np.float32, copy=False)
+        transformed = transformed.astype(np.float32, copy=False)
+        transform_s = perf_counter() - t_transform
+        if self.debug_logger is not None and self.debug_logger.enabled:
+            self.debug_logger.log(
+                "input_frame_loaded",
+                timestep=str(pd.Timestamp(timestep)),
+                filepath=str(filepath),
+                read_s=read_s,
+                pool_s=pool_s,
+                transform_s=transform_s,
+                shape_chw=list(transformed.shape),
+            )
+        return transformed
 
     def __getitem__(self, idx: int) -> tuple[dict[str, Any], dict[str, Any]]:
         reference_timestep = self.reference_timestamps[idx]
@@ -421,22 +467,40 @@ def _prompt_rollout_steps(default_value: int) -> int:
 
 
 def _load_easy_sections(config_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    with open(config_path, "r") as fp:
-        raw = yaml.safe_load(fp) or {}
-    raw_user = raw.get("user", {}) or {}
-    raw_advanced = raw.get("advanced", {}) or {}
+    with open(config_path, "r", encoding="utf-8") as fp:
+        raw = yaml.safe_load(fp)
 
-    user_cfg = deepcopy(DEFAULT_USER)
-    user_cfg.update(raw_user)
-    # Backward-compatible fallback for older configs that still store rollout_steps in advanced.
-    if "rollout_steps" not in raw_user and "rollout_steps" in raw_advanced:
-        user_cfg["rollout_steps"] = raw_advanced["rollout_steps"]
+    if raw is None:
+        raise ValueError(f"Easy config is empty: {config_path}")
+    if not isinstance(raw, dict):
+        raise ValueError(f"Easy config must be a mapping. Got {type(raw).__name__}.")
+    if "user" not in raw or "advanced" not in raw:
+        raise ValueError("Easy config must contain top-level 'user' and 'advanced' sections.")
 
-    advanced_cfg = deepcopy(DEFAULT_ADVANCED)
-    advanced_cfg.update(raw_advanced)
-    advanced_cfg.pop("rollout_steps", None)
-    advanced_cfg.pop("dataset_rollout_steps", None)
-    return user_cfg, advanced_cfg
+    raw_user = raw["user"]
+    raw_advanced = raw["advanced"]
+    if not isinstance(raw_user, dict):
+        raise ValueError(f"'user' section must be a mapping, got {type(raw_user).__name__}.")
+    if not isinstance(raw_advanced, dict):
+        raise ValueError(f"'advanced' section must be a mapping, got {type(raw_advanced).__name__}.")
+    return dict(raw_user), dict(raw_advanced)
+
+
+def _create_debug_logger(
+    advanced_cfg: dict[str, Any],
+    output_dir: Path,
+    config_dir: Path,
+) -> DebugLogger:
+    debug_enabled = bool(advanced_cfg["debug_mode"])
+    debug_log_path_raw = str(advanced_cfg["debug_log_path"]).strip()
+    if not debug_enabled:
+        return DebugLogger(enabled=False, log_path=None)
+
+    if debug_log_path_raw:
+        debug_log_path = _resolve_path(debug_log_path_raw, config_dir)
+    else:
+        debug_log_path = (output_dir / "inference_debug.txt").resolve()
+    return DebugLogger(enabled=True, log_path=debug_log_path)
 
 
 def _select_dates(
@@ -755,6 +819,11 @@ def resolve_dtype(dtype_arg: str, device_type: str) -> torch.dtype:
         return torch.bfloat16
     if device_type == "cuda":
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if device_type == "cpu":
+        cpu_bf16_supported = hasattr(torch.cpu, "is_bf16_supported") and bool(
+            torch.cpu.is_bf16_supported()
+        )
+        return torch.bfloat16 if cpu_bf16_supported else torch.float32
     if device_type == "mps":
         return torch.float16
     return torch.float32
@@ -777,6 +846,29 @@ def sync_device(device_type: str) -> None:
         torch.mps.synchronize()
 
 
+def _reset_peak_memory_stats(device_type: str, device: torch.device) -> None:
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device=device)
+
+
+def _memory_stats_mb(device_type: str, device: torch.device) -> dict[str, float]:
+    if device_type == "cuda" and torch.cuda.is_available():
+        return {
+            "mem_allocated_mb": float(torch.cuda.memory_allocated(device=device) / (1024**2)),
+            "mem_reserved_mb": float(torch.cuda.memory_reserved(device=device) / (1024**2)),
+            "mem_peak_allocated_mb": float(torch.cuda.max_memory_allocated(device=device) / (1024**2)),
+            "mem_peak_reserved_mb": float(torch.cuda.max_memory_reserved(device=device) / (1024**2)),
+        }
+    if device_type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+        return {"mem_allocated_mb": float(torch.mps.current_allocated_memory() / (1024**2))}
+    return {}
+
+
+def _read_channels_frame(filepath: Path, channels: list[str]) -> np.ndarray:
+    with h5netcdf.File(filepath, "r") as nc:
+        return np.stack([np.asarray(nc.variables[ch][:]) for ch in channels], axis=0)
+
+
 def resolve_numpy_dtype(dtype_name: str) -> np.dtype:
     if dtype_name == "float16":
         return np.float16
@@ -786,6 +878,7 @@ def resolve_numpy_dtype(dtype_name: str) -> np.dtype:
 
 
 def build_model(base_config: dict) -> HelioSpectFormer:
+    model_depth = int(base_config["model"]["depth"])
     return HelioSpectFormer(
         img_size=base_config["model"]["img_size"],
         patch_size=base_config["model"]["patch_size"],
@@ -806,7 +899,7 @@ def build_model(base_config: dict) -> HelioSpectFormer:
         learned_flow=base_config["model"]["learned_flow"],
         use_latitude_in_learned_flow=base_config["model"]["learned_flow"],
         init_weights=False,
-        checkpoint_layers=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        checkpoint_layers=list(range(model_depth)),
         rpe=base_config["model"]["rpe"],
         ensemble=base_config["model"]["ensemble"],
         finetune=base_config["model"]["finetune"],
@@ -970,34 +1063,36 @@ def _build_single_sample_dataloader(
     prefetch_factor: int,
     pin_memory: bool,
 ) -> DataLoader:
+    num_workers = int(num_workers)
     kwargs: dict[str, Any] = {
         "dataset": dataset,
         "shuffle": False,
         "batch_size": 1,
-        "num_workers": int(num_workers),
+        "num_workers": num_workers,
         "pin_memory": bool(pin_memory),
         "drop_last": False,
         "collate_fn": custom_collate_fn,
     }
-    if int(num_workers) > 0:
+    if num_workers > 0:
         kwargs["prefetch_factor"] = int(prefetch_factor)
         kwargs["persistent_workers"] = True
     return DataLoader(**kwargs)
 
 
-def _build_inverse_channel_fn(dataset: InputOnlyRolloutDataset) -> Callable[[int, np.ndarray], np.ndarray]:
+def _build_inverse_batch_fn(dataset: InputOnlyRolloutDataset) -> Callable[[np.ndarray], np.ndarray]:
     means, stds, epsilons, sl_scale_factors = dataset.transformation_inputs()
+    means_hw = means[:, None, None].astype(np.float32, copy=False)
+    stds_hw = stds[:, None, None].astype(np.float32, copy=False)
+    eps_hw = epsilons[:, None, None].astype(np.float32, copy=False)
+    scales_hw = sl_scale_factors[:, None, None].astype(np.float32, copy=False)
 
-    def inverse_channel_fn(channel_idx: int, frame_hw: np.ndarray) -> np.ndarray:
-        return inverse_transform_single_channel(
-            frame_hw,
-            mean=means[channel_idx],
-            std=stds[channel_idx],
-            epsilon=epsilons[channel_idx],
-            sl_scale_factor=sl_scale_factors[channel_idx],
-        )
+    def inverse_batch_fn(prediction_chw: np.ndarray) -> np.ndarray:
+        restored = prediction_chw.astype(np.float32, copy=False) * (stds_hw + eps_hw) + means_hw
+        restored = np.sign(restored) * np.expm1(np.abs(restored))
+        restored = restored / scales_hw
+        return restored.astype(np.float32, copy=False)
 
-    return inverse_channel_fn
+    return inverse_batch_fn
 
 
 def _build_gt_frame_loader(
@@ -1005,22 +1100,46 @@ def _build_gt_frame_loader(
     channels: list[str],
     pooling: int,
     prediction_dtype: np.dtype,
+    debug_logger: DebugLogger | None = None,
 ) -> Callable[[Any], np.ndarray | None]:
     path_lookup = present_index["path"].to_dict()
 
     def load_gt_frame_for_prediction_timestamp(ts_value: Any) -> np.ndarray | None:
+        t_total = perf_counter()
         ts = pd.Timestamp(np.asarray(ts_value).astype("datetime64[ns]").item())
         path_string = path_lookup.get(ts)
         if path_string is None:
+            if debug_logger is not None and debug_logger.enabled:
+                debug_logger.log(
+                    "gt_frame_loaded",
+                    timestep=str(ts),
+                    found=False,
+                    total_s=perf_counter() - t_total,
+                )
             return None
         filepath = Path(path_string).expanduser()
         if not filepath.is_absolute():
             filepath = (Path.cwd() / filepath).resolve()
-        with xr.open_dataset(filepath, engine="h5netcdf", chunks=None, cache=False) as ds:
-            frame = ds[channels].to_array().load().to_numpy()
+        t_read = perf_counter()
+        frame = _read_channels_frame(filepath=filepath, channels=channels)
+        read_s = perf_counter() - t_read
+        t_pool = perf_counter()
         if pooling > 1:
             frame = skimage.measure.block_reduce(frame, block_size=(1, pooling, pooling), func=np.mean)
-        return frame.astype(prediction_dtype, copy=False)
+        pool_s = perf_counter() - t_pool
+        frame = frame.astype(prediction_dtype, copy=False)
+        if debug_logger is not None and debug_logger.enabled:
+            debug_logger.log(
+                "gt_frame_loaded",
+                timestep=str(ts),
+                found=True,
+                filepath=str(filepath),
+                read_s=read_s,
+                pool_s=pool_s,
+                total_s=perf_counter() - t_total,
+                shape_chw=list(frame.shape),
+            )
+        return frame
 
     return load_gt_frame_for_prediction_timestamp
 
@@ -1029,6 +1148,7 @@ def _prepare_inference_context(
     advanced_cfg: dict[str, Any],
     config_dir: Path,
     rollout_steps: int,
+    debug_logger: DebugLogger | None = None,
 ) -> dict[str, Any]:
     foundation_config_path = _resolve_path(str(advanced_cfg["foundation_config_path"]), config_dir)
     scalers_path = _resolve_path(str(advanced_cfg["scalers_path"]), config_dir)
@@ -1043,6 +1163,11 @@ def _prepare_inference_context(
 
     device, device_type = resolve_device(str(advanced_cfg["device"]))
     amp_dtype = resolve_dtype(str(advanced_cfg["dtype"]), device_type)
+    if device_type == "cuda":
+        tf32_enabled = bool(advanced_cfg["enable_tf32"])
+        torch.backends.cuda.matmul.allow_tf32 = tf32_enabled
+        torch.backends.cudnn.allow_tf32 = tf32_enabled
+        torch.backends.cudnn.benchmark = bool(advanced_cfg["enable_cudnn_benchmark"])
     if int(advanced_cfg["cpu_threads"]) > 0:
         torch.set_num_threads(int(advanced_cfg["cpu_threads"]))
 
@@ -1059,6 +1184,15 @@ def _prepare_inference_context(
     autocast_enabled = (not bool(advanced_cfg["disable_autocast"])) and supports_autocast(
         device_type=device_type, dtype=amp_dtype
     )
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "prepare_context_done",
+            device=str(device),
+            device_type=device_type,
+            amp_dtype=str(amp_dtype),
+            autocast_enabled=autocast_enabled,
+            prediction_steps=prediction_steps,
+        )
     return {
         "base_config": base_config,
         "scalers": scalers,
@@ -1076,6 +1210,7 @@ def _prepare_inference_data(
     advanced_cfg: dict[str, Any],
     context: dict[str, Any],
     show_progress: bool,
+    debug_logger: DebugLogger | None = None,
 ) -> dict[str, Any]:
     base_config = context["base_config"]
     prediction_steps = int(context["prediction_steps"])
@@ -1111,6 +1246,7 @@ def _prepare_inference_data(
         prediction_steps=prediction_steps,
         scalers=context["scalers"],
         pooling=int(base_config["data"]["pooling"]),
+        debug_logger=debug_logger,
     )
 
     dataloader = _build_single_sample_dataloader(
@@ -1125,8 +1261,22 @@ def _prepare_inference_data(
     channels = list(base_config["data"]["sdo_channels"])
     pooling = int(base_config["data"]["pooling"])
     np_dtype = resolve_numpy_dtype(str(advanced_cfg["prediction_dtype"]))
-    if int(base_config["model"]["img_size"]) != 4096:
-        raise RuntimeError(f"Expected img_size=4096, got {int(base_config['model']['img_size'])}.")
+    expected_img_size = int(base_config["model"]["img_size"])
+    if expected_img_size <= 0:
+        raise RuntimeError(f"Expected positive img_size, got {expected_img_size}.")
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "prepare_data_done",
+            index_total=coverage.total_timestamps,
+            index_present=coverage.present_timestamps,
+            index_missing=coverage.missing_timestamps,
+            input_complete_refs=coverage.input_complete_references,
+            full_target_refs=coverage.full_target_references,
+            dataset_len=len(dataset),
+            dataloader_len=len(dataloader),
+            channels=len(channels),
+            expected_img_size=expected_img_size,
+        )
 
     return {
         "dataloader": dataloader,
@@ -1134,20 +1284,27 @@ def _prepare_inference_data(
         "np_dtype": np_dtype,
         "prediction_steps": prediction_steps,
         "target_delta_minutes": target_delta_minutes,
-        "inverse_channel_fn": _build_inverse_channel_fn(dataset),
+        "expected_img_size": expected_img_size,
+        "inverse_batch_fn": _build_inverse_batch_fn(dataset),
         "load_gt_frame_for_prediction_timestamp": _build_gt_frame_loader(
             present_index=present_index,
             channels=channels,
             pooling=pooling,
             prediction_dtype=np_dtype,
+            debug_logger=debug_logger,
         ),
     }
 
 
-def _validate_single_sample_tensor_shape(ts_tensor: torch.Tensor) -> tuple[int, int]:
+def _validate_single_sample_tensor_shape(
+    ts_tensor: torch.Tensor,
+    expected_img_size: int,
+) -> tuple[int, int]:
     full_h, full_w = int(ts_tensor.shape[-2]), int(ts_tensor.shape[-1])
-    if full_h != 4096 or full_w != 4096:
-        raise RuntimeError(f"Expected input shape 4096x4096, got {full_h}x{full_w}.")
+    if full_h != expected_img_size or full_w != expected_img_size:
+        raise RuntimeError(
+            f"Expected input shape {expected_img_size}x{expected_img_size}, got {full_h}x{full_w}."
+        )
     if int(ts_tensor.shape[0]) != 1:
         raise RuntimeError(f"Easy inference expects batch size 1, got {int(ts_tensor.shape[0])}.")
     return full_h, full_w
@@ -1161,10 +1318,15 @@ def _init_single_sample_io(
     prediction_steps: int,
     prediction_dtype: np.dtype,
     target_delta_minutes: int,
+    expected_img_size: int,
     show_progress: bool,
+    debug_logger: DebugLogger | None = None,
 ) -> dict[str, Any]:
     ts_tensor = batch_data["ts"]
-    full_h, full_w = _validate_single_sample_tensor_shape(ts_tensor)
+    full_h, full_w = _validate_single_sample_tensor_shape(
+        ts_tensor=ts_tensor,
+        expected_img_size=expected_img_size,
+    )
 
     writer = PredictionNetCDFWriter(
         output_path=str(prediction_nc_path),
@@ -1176,6 +1338,13 @@ def _init_single_sample_io(
         sample_capacity=1,
     )
     log_progress(show_progress, f"initialized prediction.nc writer | shape=1x{prediction_steps}x{full_h}x{full_w}")
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "writer_initialized",
+            prediction_steps=prediction_steps,
+            shape_hw=[full_h, full_w],
+            output_path=str(prediction_nc_path),
+        )
 
     sample_id = 0
     input_timestamps = np.asarray(batch_metadata["timestamps_input"][0]).astype("datetime64[ns]")
@@ -1211,13 +1380,21 @@ def _write_step_predictions_and_gt(
     channels: list[str],
     prediction: np.ndarray,
     gt_frame: np.ndarray | None,
-    inverse_channel_fn: Callable[[int, np.ndarray], np.ndarray],
+    inverse_batch_fn: Callable[[np.ndarray], np.ndarray],
     prediction_dtype: np.dtype,
     nan_frame_hw: np.ndarray,
-) -> float | None:
-    channel_losses: list[float] = []
+) -> tuple[float | None, float, float]:
+    t_inverse = perf_counter()
+    pred_inv_chw = inverse_batch_fn(prediction)
+    inverse_s = perf_counter() - t_inverse
+    step_loss = None
+    if gt_frame is not None:
+        diff = pred_inv_chw.astype(np.float32, copy=False) - gt_frame.astype(np.float32, copy=False)
+        step_loss = float(np.mean(diff * diff))
+
+    t_write = perf_counter()
     for channel_idx, channel_name in enumerate(channels):
-        pred_inv = inverse_channel_fn(channel_idx, prediction[channel_idx].astype(np.float32, copy=False))
+        pred_inv = pred_inv_chw[channel_idx]
         writer.write_prediction_frame(
             sample_idx=sample_id,
             prediction_step_idx=step,
@@ -1225,16 +1402,14 @@ def _write_step_predictions_and_gt(
             frame_hw=pred_inv.astype(prediction_dtype, copy=False),
         )
         gt_hw = nan_frame_hw if gt_frame is None else gt_frame[channel_idx]
-        if gt_frame is not None:
-            diff_hw = pred_inv.astype(np.float32, copy=False) - gt_hw.astype(np.float32, copy=False)
-            channel_losses.append(float(np.mean(diff_hw * diff_hw)))
         writer.write_ground_truth_frame(
             sample_idx=sample_id,
             prediction_step_idx=step,
             channel_name=channel_name,
             frame_hw=gt_hw,
         )
-    return float(np.mean(channel_losses)) if channel_losses else None
+    write_s = perf_counter() - t_write
+    return step_loss, inverse_s, write_s
 
 
 def _run_single_sample_rollout(
@@ -1248,14 +1423,17 @@ def _run_single_sample_rollout(
     input_labels: list[str],
     output_labels: list[str],
     prediction_timestamps: np.ndarray,
-    inverse_channel_fn,
+    inverse_batch_fn,
     load_gt_frame_for_prediction_timestamp,
     prediction_dtype: np.dtype,
     nan_frame_hw: np.ndarray,
+    device: torch.device,
     device_type: str,
     amp_dtype: torch.dtype,
     autocast_enabled: bool,
+    gt_prefetch_workers: int,
     show_progress: bool,
+    debug_logger: DebugLogger | None = None,
 ) -> tuple[list[float], int, int, float]:
     t_infer = perf_counter()
     step_losses: list[float] = []
@@ -1265,44 +1443,97 @@ def _run_single_sample_rollout(
     window_labels = list(input_labels)
     autocast_ctx = torch.autocast(device_type=device_type, dtype=amp_dtype) if autocast_enabled else nullcontext()
 
-    with torch.no_grad():
-        with autocast_ctx:
-            for step in range(prediction_steps):
-                pred = model({"ts": curr_ts, "time_delta_input": time_delta_input})
-                gt_pairs_expected += 1
-                if step == 0:
+    prefetch_workers = max(1, int(gt_prefetch_workers))
+    _reset_peak_memory_stats(device_type=device_type, device=device)
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "rollout_started",
+            prediction_steps=prediction_steps,
+            prefetch_workers=prefetch_workers,
+            device_type=device_type,
+            amp_dtype=str(amp_dtype),
+            autocast_enabled=autocast_enabled,
+        )
+
+    with ThreadPoolExecutor(max_workers=prefetch_workers) as io_executor:
+        next_gt_future: Future[np.ndarray | None] | None = None
+        if prediction_steps > 0:
+            next_gt_future = io_executor.submit(
+                load_gt_frame_for_prediction_timestamp, prediction_timestamps[0]
+            )
+
+        with torch.inference_mode():
+            with autocast_ctx:
+                for step in range(prediction_steps):
+                    t_step = perf_counter()
+                    t_forward = perf_counter()
+                    pred = model({"ts": curr_ts, "time_delta_input": time_delta_input})
+                    forward_s = perf_counter() - t_forward
+                    gt_pairs_expected += 1
+                    if step == 0:
+                        log_progress(
+                            show_progress,
+                            f"batch 1/1 | model_shapes in={tuple(curr_ts.shape)} out={tuple(pred.shape)}",
+                        )
+
+                    if step + 1 < prediction_steps:
+                        next_ts = prediction_timestamps[step + 1]
+                        queued_future = io_executor.submit(
+                            load_gt_frame_for_prediction_timestamp, next_ts
+                        )
+                    else:
+                        queued_future = None
+
+                    t_to_cpu = perf_counter()
+                    pred_cpu = pred.detach().cpu().float().numpy()[0]
+                    to_cpu_s = perf_counter() - t_to_cpu
+                    t_wait_gt = perf_counter()
+                    gt_frame = next_gt_future.result() if next_gt_future is not None else None
+                    wait_gt_s = perf_counter() - t_wait_gt
+                    next_gt_future = queued_future
+                    if gt_frame is not None:
+                        gt_pairs_used += 1
+
+                    step_loss, inverse_s, write_s = _write_step_predictions_and_gt(
+                        writer=writer,
+                        sample_id=sample_id,
+                        step=step,
+                        channels=channels,
+                        prediction=pred_cpu,
+                        gt_frame=gt_frame,
+                        inverse_batch_fn=inverse_batch_fn,
+                        prediction_dtype=prediction_dtype,
+                        nan_frame_hw=nan_frame_hw,
+                    )
+                    if step_loss is not None:
+                        step_losses.append(step_loss)
+                    loss_text = f"loss={step_loss:.6f}" if step_loss is not None else "GT missing"
+                    output_label = output_labels[step]
+                    step_input_labels = list(window_labels)
                     log_progress(
                         show_progress,
-                        f"batch 1/1 | model_shapes in={tuple(curr_ts.shape)} out={tuple(pred.shape)}",
+                        f"infer step {step + 1}/{prediction_steps} | "
+                        f"in={_format_items_for_log(window_labels, max_items=32)} -> out={output_label} | {loss_text}",
                     )
-
-                pred_cpu = pred.detach().cpu().float().numpy()[0]
-                gt_frame = load_gt_frame_for_prediction_timestamp(prediction_timestamps[step])
-                if gt_frame is not None:
-                    gt_pairs_used += 1
-
-                step_loss = _write_step_predictions_and_gt(
-                    writer=writer,
-                    sample_id=sample_id,
-                    step=step,
-                    channels=channels,
-                    prediction=pred_cpu,
-                    gt_frame=gt_frame,
-                    inverse_channel_fn=inverse_channel_fn,
-                    prediction_dtype=prediction_dtype,
-                    nan_frame_hw=nan_frame_hw,
-                )
-                if step_loss is not None:
-                    step_losses.append(step_loss)
-                loss_text = f"loss={step_loss:.6f}" if step_loss is not None else "GT missing"
-                output_label = output_labels[step]
-                log_progress(
-                    show_progress,
-                    f"infer step {step + 1}/{prediction_steps} | "
-                    f"in={_format_items_for_log(window_labels, max_items=32)} -> out={output_label} | {loss_text}",
-                )
-                window_labels = window_labels[1:] + [output_label]
-                curr_ts = torch.cat((curr_ts[:, :, 1:, ...], pred[:, :, None, ...]), dim=2)
+                    window_labels = window_labels[1:] + [output_label]
+                    curr_ts = torch.cat((curr_ts[:, :, 1:, ...], pred[:, :, None, ...]), dim=2)
+                    if debug_logger is not None and debug_logger.enabled:
+                        debug_logger.log(
+                            "infer_step",
+                            step=step + 1,
+                            steps_total=prediction_steps,
+                            input_labels=step_input_labels,
+                            output_label=output_label,
+                            gt_available=gt_frame is not None,
+                            loss=step_loss,
+                            forward_s=forward_s,
+                            pred_to_cpu_s=to_cpu_s,
+                            gt_wait_s=wait_gt_s,
+                            inverse_transform_s=inverse_s,
+                            write_s=write_s,
+                            step_total_s=perf_counter() - t_step,
+                            **_memory_stats_mb(device_type=device_type, device=device),
+                        )
 
     sync_device(device_type)
     return step_losses, gt_pairs_used, gt_pairs_expected, (perf_counter() - t_infer)
@@ -1314,20 +1545,61 @@ def run_inference_pipeline(
     prediction_nc_path: Path,
     rollout_steps: int,
     show_progress: bool,
+    debug_logger: DebugLogger | None = None,
 ) -> InferenceSummary:
-    context = _prepare_inference_context(advanced_cfg=advanced_cfg, config_dir=config_dir, rollout_steps=rollout_steps)
-    data = _prepare_inference_data(advanced_cfg=advanced_cfg, context=context, show_progress=show_progress)
+    t_context = perf_counter()
+    context = _prepare_inference_context(
+        advanced_cfg=advanced_cfg,
+        config_dir=config_dir,
+        rollout_steps=rollout_steps,
+        debug_logger=debug_logger,
+    )
+    context_s = perf_counter() - t_context
+
+    t_prepare_data = perf_counter()
+    data = _prepare_inference_data(
+        advanced_cfg=advanced_cfg,
+        context=context,
+        show_progress=show_progress,
+        debug_logger=debug_logger,
+    )
+    prepare_data_s = perf_counter() - t_prepare_data
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "inference_prepare_complete",
+            context_s=context_s,
+            prepare_data_s=prepare_data_s,
+        )
 
     iterator = iter(data["dataloader"])
     log_progress(show_progress, "batch 1/1 | loading data")
     t_data = perf_counter()
     batch_data, batch_metadata = next(iterator)
     data_elapsed = perf_counter() - t_data
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "batch_loaded",
+            data_load_s=data_elapsed,
+            batch_ts_shape=list(batch_data["ts"].shape),
+            batch_time_delta_shape=list(batch_data["time_delta_input"].shape),
+        )
 
+    t_to_device = perf_counter()
     ts = batch_data["ts"].to(context["device"], non_blocking=True)
     time_delta_input = batch_data["time_delta_input"].to(context["device"], non_blocking=True)
+    to_device_s = perf_counter() - t_to_device
     log_progress(show_progress, f"batch 1/1 | tensors input_ts={tuple(ts.shape)} time_delta_input={tuple(time_delta_input.shape)}")
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "batch_to_device",
+            to_device_s=to_device_s,
+            ts_dtype=str(ts.dtype),
+            time_delta_dtype=str(time_delta_input.dtype),
+            device=str(context["device"]),
+            **_memory_stats_mb(device_type=context["device_type"], device=context["device"]),
+        )
 
+    t_io_init = perf_counter()
     io = _init_single_sample_io(
         batch_data=batch_data,
         batch_metadata=batch_metadata,
@@ -1336,8 +1608,13 @@ def run_inference_pipeline(
         prediction_steps=data["prediction_steps"],
         prediction_dtype=data["np_dtype"],
         target_delta_minutes=data["target_delta_minutes"],
+        expected_img_size=data["expected_img_size"],
         show_progress=show_progress,
+        debug_logger=debug_logger,
     )
+    io_init_s = perf_counter() - t_io_init
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log("io_initialized", io_init_s=io_init_s)
 
     step_losses, gt_pairs_used, gt_pairs_expected, infer_elapsed = _run_single_sample_rollout(
         model=context["model"],
@@ -1350,24 +1627,41 @@ def run_inference_pipeline(
         input_labels=io["input_labels"],
         output_labels=io["output_labels"],
         prediction_timestamps=io["prediction_timestamps"],
-        inverse_channel_fn=data["inverse_channel_fn"],
+        inverse_batch_fn=data["inverse_batch_fn"],
         load_gt_frame_for_prediction_timestamp=data["load_gt_frame_for_prediction_timestamp"],
         prediction_dtype=data["np_dtype"],
         nan_frame_hw=io["nan_frame_hw"],
+        device=context["device"],
         device_type=context["device_type"],
         amp_dtype=context["amp_dtype"],
         autocast_enabled=context["autocast_enabled"],
+        gt_prefetch_workers=int(advanced_cfg["gt_prefetch_workers"]),
         show_progress=show_progress,
+        debug_logger=debug_logger,
     )
 
     batch_loss = float(np.mean(step_losses)) if step_losses else float("nan")
     batch_loss_text = f"loss={batch_loss:.6f}" if np.isfinite(batch_loss) else "GT missing"
     log_progress(show_progress, f"batch 1/1 | done forward | {batch_loss_text} | gt_steps_used={len(step_losses)}/{data['prediction_steps']} | infer_s={infer_elapsed:.3f}")
 
+    t_finalize = perf_counter()
     output_path = io["writer"].finalize(samples_written=1)
+    finalize_s = perf_counter() - t_finalize
     log_progress(show_progress, f"saved prediction.nc | path={output_path}")
     if not np.isfinite(batch_loss):
         log_progress(show_progress, "No valid ground-truth targets available for requested rollout. GT missing; saving predictions without MSE.")
+    if debug_logger is not None and debug_logger.enabled:
+        debug_logger.log(
+            "inference_complete",
+            infer_s=infer_elapsed,
+            finalize_s=finalize_s,
+            avg_loss=None if not np.isfinite(batch_loss) else batch_loss,
+            gt_steps_used=len(step_losses),
+            prediction_steps=data["prediction_steps"],
+            mode=("input_only" if gt_pairs_used == 0 else ("partial_gt" if gt_pairs_used < gt_pairs_expected else "full_gt")),
+            output_path=output_path,
+            **_memory_stats_mb(device_type=context["device_type"], device=context["device"]),
+        )
 
     mode = "input_only" if gt_pairs_used == 0 else ("partial_gt" if gt_pairs_used < gt_pairs_expected else "full_gt")
     return InferenceSummary(
@@ -1443,6 +1737,7 @@ def main() -> int:
     validation_data_dir = _resolve_path(str(advanced_cfg["validation_data_dir"]), config_dir)
     index_path = _resolve_path(str(advanced_cfg["index_path"]), config_dir)
     show_progress = bool(advanced_cfg["show_progress"])
+    debug_logger = _create_debug_logger(advanced_cfg=advanced_cfg, output_dir=output_dir, config_dir=config_dir)
 
     print(f"Easy config          : {config_path}")
     print(
@@ -1459,76 +1754,94 @@ def main() -> int:
     )
     print(f"Target delta (min)   : {int(advanced_cfg['time_delta_target_minutes'])}")
     print("Sample mode          : first valid sample only (batch=1)")
-
-    if args.dry_run:
-        print("Dry run enabled. No download or inference executed.")
-        return 0
+    if debug_logger.enabled:
+        print(f"Debug mode           : enabled ({debug_logger.log_path})")
 
     try:
-        _validate_rollout_against_window(
-            start_dt=start_dt,
-            end_dt=end_dt,
-            time_delta_input_minutes=[int(v) for v in advanced_cfg["time_delta_input_minutes"]],
-            time_delta_target_minutes=int(advanced_cfg["time_delta_target_minutes"]),
-            rollout_steps=int(rollout_steps),
-        )
-    except Exception as exc:
-        print(f"ERROR rollout validation: {exc}", file=sys.stderr)
-        return 1
+        if debug_logger.enabled:
+            debug_logger.log(
+                "run_started",
+                config_path=str(config_path),
+                start_datetime_utc=_format_datetime(start_dt),
+                end_datetime_utc=_format_datetime(end_dt),
+                rollout_steps=int(rollout_steps),
+            )
+        if args.dry_run:
+            print("Dry run enabled. No download or inference executed.")
+            return 0
 
-    try:
-        ensure_model_assets(advanced_cfg=advanced_cfg, config_dir=config_dir)
-    except Exception as exc:
-        print(f"ERROR downloading model assets: {exc}", file=sys.stderr)
-        return 1
-
-    download_summary: DownloadSummary | None = None
-    if not args.skip_download:
         try:
-            download_summary = download_surya_bench_range(
-                bucket=str(advanced_cfg["s3_bucket"]),
-                output_dir=validation_data_dir,
-                start_datetime=start_dt,
-                end_datetime=end_dt,
-                cadence_minutes=int(advanced_cfg["cadence_minutes"]),
-                skip_existing=bool(advanced_cfg["download_skip_existing"]),
-                verify_size=bool(advanced_cfg["download_verify_size"]),
-                match_tolerance_minutes=int(advanced_cfg["download_match_tolerance_minutes"]),
-                prune_to_expected=bool(advanced_cfg["prune_validation_data_to_window"]),
-                show_progress=show_progress,
+            _validate_rollout_against_window(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                time_delta_input_minutes=[int(v) for v in advanced_cfg["time_delta_input_minutes"]],
+                time_delta_target_minutes=int(advanced_cfg["time_delta_target_minutes"]),
+                rollout_steps=int(rollout_steps),
             )
         except Exception as exc:
-            print(f"ERROR during download: {exc}", file=sys.stderr)
+            print(f"ERROR rollout validation: {exc}", file=sys.stderr)
             return 1
-    else:
-        log_progress(show_progress, "skipping download by request")
 
-    build_index_csv_for_range(
-        validation_data_dir=validation_data_dir,
-        index_path=index_path,
-        start_datetime=start_dt,
-        end_datetime=end_dt,
-        cadence_minutes=int(advanced_cfg["cadence_minutes"]),
-    )
-    try:
-        inference_summary = run_inference_pipeline(
-            advanced_cfg=advanced_cfg,
-            config_dir=config_dir,
-            prediction_nc_path=prediction_nc_path,
-            rollout_steps=int(rollout_steps),
-            show_progress=show_progress,
+        try:
+            ensure_model_assets(advanced_cfg=advanced_cfg, config_dir=config_dir)
+        except Exception as exc:
+            print(f"ERROR downloading model assets: {exc}", file=sys.stderr)
+            return 1
+
+        download_summary: DownloadSummary | None = None
+        if not args.skip_download:
+            try:
+                download_summary = download_surya_bench_range(
+                    bucket=str(advanced_cfg["s3_bucket"]),
+                    output_dir=validation_data_dir,
+                    start_datetime=start_dt,
+                    end_datetime=end_dt,
+                    cadence_minutes=int(advanced_cfg["cadence_minutes"]),
+                    skip_existing=bool(advanced_cfg["download_skip_existing"]),
+                    verify_size=bool(advanced_cfg["download_verify_size"]),
+                    match_tolerance_minutes=int(advanced_cfg["download_match_tolerance_minutes"]),
+                    prune_to_expected=bool(advanced_cfg["prune_validation_data_to_window"]),
+                    show_progress=show_progress,
+                )
+            except Exception as exc:
+                print(f"ERROR during download: {exc}", file=sys.stderr)
+                return 1
+        else:
+            log_progress(show_progress, "skipping download by request")
+
+        t_index = perf_counter()
+        build_index_csv_for_range(
+            validation_data_dir=validation_data_dir,
+            index_path=index_path,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+            cadence_minutes=int(advanced_cfg["cadence_minutes"]),
         )
-    except Exception as exc:
-        print(f"ERROR during inference: {exc}", file=sys.stderr)
-        return 1
+        if debug_logger.enabled:
+            debug_logger.log("index_built", index_build_s=perf_counter() - t_index, index_path=str(index_path))
 
-    print_report(
-        download_summary=download_summary,
-        inference_summary=inference_summary,
-        start_dt=start_dt,
-        end_dt=end_dt,
-    )
-    return 0
+        try:
+            inference_summary = run_inference_pipeline(
+                advanced_cfg=advanced_cfg,
+                config_dir=config_dir,
+                prediction_nc_path=prediction_nc_path,
+                rollout_steps=int(rollout_steps),
+                show_progress=show_progress,
+                debug_logger=debug_logger,
+            )
+        except Exception as exc:
+            print(f"ERROR during inference: {exc}", file=sys.stderr)
+            return 1
+
+        print_report(
+            download_summary=download_summary,
+            inference_summary=inference_summary,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        return 0
+    finally:
+        debug_logger.close()
 
 
 if __name__ == "__main__":
