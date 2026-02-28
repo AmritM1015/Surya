@@ -77,7 +77,7 @@ advanced:
   # DataLoader prefetch batches per worker (used only when num_workers > 0).
   prefetch_factor: 2
   # Number of background workers for GT timestep prefetch during rollout (>=1).
-  gt_prefetch_workers: 1
+  gt_prefetch_workers: 4
   # If true, disable autocast mixed precision even when supported.
   disable_autocast: false
   # If true, allow TF32 fast matmul/cudnn paths on CUDA.
@@ -91,7 +91,7 @@ advanced:
   # If true, write detailed debug profiling logs (plain text).
   debug_mode: false
   # Optional path for debug log file. Empty -> <user.output_dir>/inference_debug.txt
-  debug_log_path: ""
+  debug_log_path: "easy_inference/inference_debug.txt"
 
   # Output dtype for saved prediction.nc values. Values: float16 | float32
   prediction_dtype: float32

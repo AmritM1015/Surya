@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -339,7 +339,14 @@ class InputOnlyRolloutDataset(Dataset):
         input_timestamps = [
             reference_timestep + timedelta(minutes=offset) for offset in self.time_delta_input_minutes
         ]
-        input_frames = [self._load_transformed_frame(ts) for ts in input_timestamps]
+        if len(input_timestamps) > 1:
+            with ThreadPoolExecutor(max_workers=len(input_timestamps)) as pool:
+                futures = {pool.submit(self._load_transformed_frame, ts): i for i, ts in enumerate(input_timestamps)}
+                input_frames = [None] * len(input_timestamps)
+                for fut in as_completed(futures):
+                    input_frames[futures[fut]] = fut.result()
+        else:
+            input_frames = [self._load_transformed_frame(ts) for ts in input_timestamps]
         stacked_inputs = np.stack(input_frames, axis=1).astype(np.float32, copy=False)
 
         target_timestamps: list[np.datetime64] = []
@@ -405,6 +412,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-download",
         action="store_true",
         help="Skip S3 download and reuse existing data files.",
+    )
+    parser.add_argument(
+        "--skip-gt",
+        action="store_true",
+        help="Skip ground-truth loading and loss computation for faster inference.",
     )
     parser.add_argument(
         "--dry-run",
@@ -878,7 +890,6 @@ def resolve_numpy_dtype(dtype_name: str) -> np.dtype:
 
 
 def build_model(base_config: dict) -> HelioSpectFormer:
-    model_depth = int(base_config["model"]["depth"])
     return HelioSpectFormer(
         img_size=base_config["model"]["img_size"],
         patch_size=base_config["model"]["patch_size"],
@@ -899,7 +910,7 @@ def build_model(base_config: dict) -> HelioSpectFormer:
         learned_flow=base_config["model"]["learned_flow"],
         use_latitude_in_learned_flow=base_config["model"]["learned_flow"],
         init_weights=False,
-        checkpoint_layers=list(range(model_depth)),
+        checkpoint_layers=None,
         rpe=base_config["model"]["rpe"],
         ensemble=base_config["model"]["ensemble"],
         finetune=base_config["model"]["finetune"],
@@ -1095,6 +1106,24 @@ def _build_inverse_batch_fn(dataset: InputOnlyRolloutDataset) -> Callable[[np.nd
     return inverse_batch_fn
 
 
+def _build_inverse_batch_fn_gpu(
+    dataset: InputOnlyRolloutDataset, device: torch.device,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    means, stds, epsilons, sl_scale_factors = dataset.transformation_inputs()
+    means_t = torch.from_numpy(means[:, None, None]).float().to(device)
+    stds_t = torch.from_numpy(stds[:, None, None]).float().to(device)
+    eps_t = torch.from_numpy(epsilons[:, None, None]).float().to(device)
+    scales_t = torch.from_numpy(sl_scale_factors[:, None, None]).float().to(device)
+
+    def inverse_batch_fn_gpu(prediction_chw: torch.Tensor) -> torch.Tensor:
+        restored = prediction_chw.float() * (stds_t + eps_t) + means_t
+        restored = torch.sign(restored) * torch.expm1(torch.abs(restored))
+        restored = restored / scales_t
+        return restored
+
+    return inverse_batch_fn_gpu
+
+
 def _build_gt_frame_loader(
     present_index: pd.DataFrame,
     channels: list[str],
@@ -1179,6 +1208,8 @@ def _prepare_inference_context(
     model.load_state_dict(weights, strict=True)
     model.to(device)
     model.eval()
+    if device_type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
 
     prediction_steps = int(rollout_steps) + 1
     autocast_enabled = (not bool(advanced_cfg["disable_autocast"])) and supports_autocast(
@@ -1286,6 +1317,7 @@ def _prepare_inference_data(
         "target_delta_minutes": target_delta_minutes,
         "expected_img_size": expected_img_size,
         "inverse_batch_fn": _build_inverse_batch_fn(dataset),
+        "inverse_batch_fn_gpu": _build_inverse_batch_fn_gpu(dataset, context["device"]),
         "load_gt_frame_for_prediction_timestamp": _build_gt_frame_loader(
             present_index=present_index,
             channels=channels,
@@ -1373,45 +1405,6 @@ def _init_single_sample_io(
     }
 
 
-def _write_step_predictions_and_gt(
-    writer: PredictionNetCDFWriter,
-    sample_id: int,
-    step: int,
-    channels: list[str],
-    prediction: np.ndarray,
-    gt_frame: np.ndarray | None,
-    inverse_batch_fn: Callable[[np.ndarray], np.ndarray],
-    prediction_dtype: np.dtype,
-    nan_frame_hw: np.ndarray,
-) -> tuple[float | None, float, float]:
-    t_inverse = perf_counter()
-    pred_inv_chw = inverse_batch_fn(prediction)
-    inverse_s = perf_counter() - t_inverse
-    step_loss = None
-    if gt_frame is not None:
-        diff = pred_inv_chw.astype(np.float32, copy=False) - gt_frame.astype(np.float32, copy=False)
-        step_loss = float(np.mean(diff * diff))
-
-    t_write = perf_counter()
-    for channel_idx, channel_name in enumerate(channels):
-        pred_inv = pred_inv_chw[channel_idx]
-        writer.write_prediction_frame(
-            sample_idx=sample_id,
-            prediction_step_idx=step,
-            channel_name=channel_name,
-            frame_hw=pred_inv.astype(prediction_dtype, copy=False),
-        )
-        gt_hw = nan_frame_hw if gt_frame is None else gt_frame[channel_idx]
-        writer.write_ground_truth_frame(
-            sample_idx=sample_id,
-            prediction_step_idx=step,
-            channel_name=channel_name,
-            frame_hw=gt_hw,
-        )
-    write_s = perf_counter() - t_write
-    return step_loss, inverse_s, write_s
-
-
 def _run_single_sample_rollout(
     model,
     ts: torch.Tensor,
@@ -1434,6 +1427,10 @@ def _run_single_sample_rollout(
     gt_prefetch_workers: int,
     show_progress: bool,
     debug_logger: DebugLogger | None = None,
+    skip_gt: bool = False,
+    inverse_batch_fn_gpu=None,
+    pre_gt_futures: list | None = None,
+    gt_executor: ThreadPoolExecutor | None = None,
 ) -> tuple[list[float], int, int, float]:
     t_infer = perf_counter()
     step_losses: list[float] = []
@@ -1455,12 +1452,27 @@ def _run_single_sample_rollout(
             autocast_enabled=autocast_enabled,
         )
 
-    with ThreadPoolExecutor(max_workers=prefetch_workers) as io_executor:
-        next_gt_future: Future[np.ndarray | None] | None = None
-        if prediction_steps > 0:
-            next_gt_future = io_executor.submit(
-                load_gt_frame_for_prediction_timestamp, prediction_timestamps[0]
-            )
+    use_gpu_inverse = inverse_batch_fn_gpu is not None and device_type == "cuda"
+
+    # Use pre-submitted GT futures if available; otherwise create new executor
+    owns_executor = gt_executor is None
+    if owns_executor:
+        gt_executor = ThreadPoolExecutor(max_workers=max(prefetch_workers, 2))
+
+    gt_futures: list[Future[np.ndarray | None] | None]
+    if pre_gt_futures is not None:
+        gt_futures = pre_gt_futures
+    elif not skip_gt:
+        gt_futures = [
+            gt_executor.submit(load_gt_frame_for_prediction_timestamp, prediction_timestamps[i])
+            for i in range(prediction_steps)
+        ]
+    else:
+        gt_futures = [None] * prediction_steps
+
+    try:
+        # Track pending write futures to overlap write with next forward
+        prev_write_future: Future | None = None
 
         with torch.inference_mode():
             with autocast_ctx:
@@ -1468,6 +1480,7 @@ def _run_single_sample_rollout(
                     t_step = perf_counter()
                     t_forward = perf_counter()
                     pred = model({"ts": curr_ts, "time_delta_input": time_delta_input})
+                    sync_device(device_type)
                     forward_s = perf_counter() - t_forward
                     gt_pairs_expected += 1
                     if step == 0:
@@ -1476,38 +1489,38 @@ def _run_single_sample_rollout(
                             f"batch 1/1 | model_shapes in={tuple(curr_ts.shape)} out={tuple(pred.shape)}",
                         )
 
-                    if step + 1 < prediction_steps:
-                        next_ts = prediction_timestamps[step + 1]
-                        queued_future = io_executor.submit(
-                            load_gt_frame_for_prediction_timestamp, next_ts
-                        )
+                    # Do inverse transform on GPU, then move to CPU
+                    t_inverse = perf_counter()
+                    if use_gpu_inverse:
+                        pred_inv_gpu = inverse_batch_fn_gpu(pred[0])
+                        pred_inv_chw = pred_inv_gpu.cpu().numpy()
+                        del pred_inv_gpu
                     else:
-                        queued_future = None
+                        pred_cpu = pred.detach().cpu().float().numpy()[0]
+                        pred_inv_chw = inverse_batch_fn(pred_cpu)
+                    inverse_s = perf_counter() - t_inverse
 
-                    t_to_cpu = perf_counter()
-                    pred_cpu = pred.detach().cpu().float().numpy()[0]
-                    to_cpu_s = perf_counter() - t_to_cpu
-                    t_wait_gt = perf_counter()
-                    gt_frame = next_gt_future.result() if next_gt_future is not None else None
-                    wait_gt_s = perf_counter() - t_wait_gt
-                    next_gt_future = queued_future
+                    # Get GT (should already be loaded from pre-submitted futures)
+                    if skip_gt:
+                        gt_frame = None
+                        wait_gt_s = 0.0
+                    else:
+                        t_wait_gt = perf_counter()
+                        gt_future = gt_futures[step]
+                        gt_frame = gt_future.result() if gt_future is not None else None
+                        wait_gt_s = perf_counter() - t_wait_gt
                     if gt_frame is not None:
                         gt_pairs_used += 1
 
-                    step_loss, inverse_s, write_s = _write_step_predictions_and_gt(
-                        writer=writer,
-                        sample_id=sample_id,
-                        step=step,
-                        channels=channels,
-                        prediction=pred_cpu,
-                        gt_frame=gt_frame,
-                        inverse_batch_fn=inverse_batch_fn,
-                        prediction_dtype=prediction_dtype,
-                        nan_frame_hw=nan_frame_hw,
-                    )
+                    # Compute loss
+                    step_loss = None
+                    if gt_frame is not None:
+                        diff = pred_inv_chw.astype(np.float32, copy=False) - gt_frame.astype(np.float32, copy=False)
+                        step_loss = float(np.mean(diff * diff))
+
                     if step_loss is not None:
                         step_losses.append(step_loss)
-                    loss_text = f"loss={step_loss:.6f}" if step_loss is not None else "GT missing"
+                    loss_text = f"loss={step_loss:.6f}" if step_loss is not None else "GT skipped"
                     output_label = output_labels[step]
                     step_input_labels = list(window_labels)
                     log_progress(
@@ -1515,6 +1528,35 @@ def _run_single_sample_rollout(
                         f"infer step {step + 1}/{prediction_steps} | "
                         f"in={_format_items_for_log(window_labels, max_items=32)} -> out={output_label} | {loss_text}",
                     )
+
+                    # Wait for previous write to finish before submitting new one
+                    if prev_write_future is not None:
+                        prev_write_future.result()
+
+                    # Submit write in background thread to overlap with next forward
+                    _step = step
+                    _pred_inv = pred_inv_chw
+                    _gt = gt_frame
+                    _dtype = prediction_dtype
+
+                    def _do_write(s=_step, p=_pred_inv, g=_gt, d=_dtype):
+                        for ci, cn in enumerate(channels):
+                            writer.write_prediction_frame(
+                                sample_idx=sample_id,
+                                prediction_step_idx=s,
+                                channel_name=cn,
+                                frame_hw=p[ci].astype(d, copy=False),
+                            )
+                            gt_hw = nan_frame_hw if g is None else g[ci]
+                            writer.write_ground_truth_frame(
+                                sample_idx=sample_id,
+                                prediction_step_idx=s,
+                                channel_name=cn,
+                                frame_hw=gt_hw,
+                            )
+
+                    prev_write_future = gt_executor.submit(_do_write)
+
                     window_labels = window_labels[1:] + [output_label]
                     curr_ts = torch.cat((curr_ts[:, :, 1:, ...], pred[:, :, None, ...]), dim=2)
                     if debug_logger is not None and debug_logger.enabled:
@@ -1527,13 +1569,20 @@ def _run_single_sample_rollout(
                             gt_available=gt_frame is not None,
                             loss=step_loss,
                             forward_s=forward_s,
-                            pred_to_cpu_s=to_cpu_s,
+                            pred_to_cpu_s=0.0,
                             gt_wait_s=wait_gt_s,
                             inverse_transform_s=inverse_s,
-                            write_s=write_s,
+                            write_s=0.0,
                             step_total_s=perf_counter() - t_step,
                             **_memory_stats_mb(device_type=device_type, device=device),
                         )
+
+            # Wait for final write
+            if prev_write_future is not None:
+                prev_write_future.result()
+    finally:
+        if owns_executor:
+            gt_executor.shutdown(wait=True)
 
     sync_device(device_type)
     return step_losses, gt_pairs_used, gt_pairs_expected, (perf_counter() - t_infer)
@@ -1546,6 +1595,7 @@ def run_inference_pipeline(
     rollout_steps: int,
     show_progress: bool,
     debug_logger: DebugLogger | None = None,
+    skip_gt: bool = False,
 ) -> InferenceSummary:
     t_context = perf_counter()
     context = _prepare_inference_context(
@@ -1599,6 +1649,7 @@ def run_inference_pipeline(
             **_memory_stats_mb(device_type=context["device_type"], device=context["device"]),
         )
 
+    # IO init (needs batch_data for shapes)
     t_io_init = perf_counter()
     io = _init_single_sample_io(
         batch_data=batch_data,
@@ -1615,6 +1666,22 @@ def run_inference_pipeline(
     io_init_s = perf_counter() - t_io_init
     if debug_logger is not None and debug_logger.enabled:
         debug_logger.log("io_initialized", io_init_s=io_init_s)
+
+    # Start GT prefetch NOW (before warmup) so GT loads overlap with compilation
+    gt_prefetch_workers = max(1, int(advanced_cfg["gt_prefetch_workers"]))
+    gt_executor = ThreadPoolExecutor(max_workers=max(gt_prefetch_workers, data["prediction_steps"]))
+    pre_gt_futures: list[Future | None] = []
+    if not skip_gt:
+        log_progress(show_progress, f"prefetch | submitting {data['prediction_steps']} GT frame loads")
+        for step_idx in range(data["prediction_steps"]):
+            pre_gt_futures.append(
+                gt_executor.submit(
+                    data["load_gt_frame_for_prediction_timestamp"],
+                    io["prediction_timestamps"][step_idx],
+                )
+            )
+    else:
+        pre_gt_futures = [None] * data["prediction_steps"]
 
     step_losses, gt_pairs_used, gt_pairs_expected, infer_elapsed = _run_single_sample_rollout(
         model=context["model"],
@@ -1635,9 +1702,13 @@ def run_inference_pipeline(
         device_type=context["device_type"],
         amp_dtype=context["amp_dtype"],
         autocast_enabled=context["autocast_enabled"],
-        gt_prefetch_workers=int(advanced_cfg["gt_prefetch_workers"]),
+        gt_prefetch_workers=gt_prefetch_workers,
         show_progress=show_progress,
         debug_logger=debug_logger,
+        skip_gt=skip_gt,
+        inverse_batch_fn_gpu=data["inverse_batch_fn_gpu"],
+        pre_gt_futures=pre_gt_futures,
+        gt_executor=gt_executor,
     )
 
     batch_loss = float(np.mean(step_losses)) if step_losses else float("nan")
@@ -1828,6 +1899,7 @@ def main() -> int:
                 rollout_steps=int(rollout_steps),
                 show_progress=show_progress,
                 debug_logger=debug_logger,
+                skip_gt=bool(args.skip_gt),
             )
         except Exception as exc:
             print(f"ERROR during inference: {exc}", file=sys.stderr)
