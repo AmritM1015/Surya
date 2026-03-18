@@ -66,6 +66,23 @@ uv sync
 source .venv/bin/activate
 ```
 
+4. **Zero-Shot Inference**
+```bash
+python easy_inference/run_easy_inference.py --config-path easy_inference/config_easy.yaml
+```
+
+#### Note
+The above command is the fastest path to run Surya foundation-model inference on a date range without any additional setup. Data is downloaded from the public S3 bucket `nasa-surya-bench`. This prompts for start/end UTC datetime, downloads needed `.nc` files, and writes:
+- `easy_inference/outputs_.../prediction.nc`
+- `easy_inference/outputs_.../metrics/*`
+
+**Device selection behavior**
+- Please refer to the [config_easy.yaml](easy_inference/config_easy.yaml) file for the default inference configuration.
+- `advanced.device: auto` uses priority: `cuda -> mps -> cpu`
+- Works across CUDA GPUs, Apple Silicon/macOS MPS, and plain CPU systems
+
+---
+
 ### 🧪 Verify Installation
 
 Run the end-to-end test to ensure everything is working:
@@ -115,7 +132,7 @@ Predict M-class and X-class solar flares up to 24 hours in advance.
 
 ```bash
 cd downstream_examples/solar_flare_forcasting
-python3 download_data.sh
+bash download_data.sh
 torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 ```
 
@@ -125,7 +142,7 @@ Segment solar active regions and polarity inversion lines from magnetograms.
 
 ```bash
 cd downstream_examples/ar_segmentation  
-python3 download_data.sh
+bash download_data.sh
 torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 ```
 
@@ -135,7 +152,7 @@ Predict solar wind speed at L1 point with 4-day lead time.
 
 ```bash
 cd downstream_examples/solar_wind_forcasting
-python3 download_data.sh
+bash download_data.sh
 torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 ```
 
@@ -145,7 +162,7 @@ Model extreme ultraviolet irradiance across 1343 spectral bands (5-35 nm).
 
 ```bash
 cd downstream_examples/euv_spectra_prediction
-python3 download_data.sh
+bash download_data.sh
 torchrun --nnodes=1 --nproc_per_node=1 --standalone finetune.py
 ```
 
