@@ -1,0 +1,9 @@
+path,timestep,present
+data/Surya-1.0_validation_data_20141023_60min/20141023_1000.nc,2014-10-23 10:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1100.nc,2014-10-23 11:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1200.nc,2014-10-23 12:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1300.nc,2014-10-23 13:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1400.nc,2014-10-23 14:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1500.nc,2014-10-23 15:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1600.nc,2014-10-23 16:00:00,1
+data/Surya-1.0_validation_data_20141023_60min/20141023_1700.nc,2014-10-23 17:00:00,1
